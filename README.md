@@ -7,6 +7,164 @@ entrer, ni se faire passer pour l'un d'eux.
 Le contrat complet (API, options, erreurs, garanties, protocole) est dans
 [CONTRACT.md](CONTRACT.md).
 
+## Installer
+
+```
+npm install @meitogi/signal
+```
+
+| Import | Où | Pour |
+|---|---|---|
+| `@meitogi/signal` | navigateur | `joinRoom()`, `newSecret()`, `formatLink()` / `parseLink()`, `SignalError` — aucune dépendance |
+| `@meitogi/signal/node` | Node ≥ 22 | la même API ; WebRTC par [werift](https://github.com/shinyoshiaki/werift-webrtc) (pur JS, sans binaire natif), WebSocket par `ws` |
+| `npx @meitogi/signal` | terminal | lance un relay (plus bas) |
+
+## Rejoindre une room
+
+```js
+import { joinRoom, newSecret } from '@meitogi/signal'; // ou '@meitogi/signal/node'
+
+const secret = newSecret(); // à partager avec les autres, jamais avec un serveur
+
+const room = joinRoom({
+  relay: 'wss://signal.du.ranchchoco.boo',
+  room: 'partie-du-soir',
+  secret,
+  max: 4, // pris en compte seulement si on crée la room
+});
+
+room.on('peer', (peer) => {
+  peer.on('message', (data) => console.log(peer.id, data));
+  peer.send('salut');
+});
+room.on('leave', (peer, reason) => console.log('parti', peer.id, reason));
+room.on('error', (e) => console.warn('incident', e.code, e.message)); // la room continue
+room.on('close', (error) => console.log('room terminée', error?.code)); // null après leave()
+
+await room.ready; // on est dans la room
+await room.broadcast('à tous');
+room.leave();
+```
+
+`joinRoom()` retourne la room tout de suite : on branche les écouteurs avant que le
+réseau ne bouge. `room.ready` dit quand on est entré (ou rejette avec une `SignalError`
+fatale). Le relay peut tomber sans casser les connexions directes : la room s'y
+reconnecte seule (0,5 s, 1 s, 2 s… jusqu'à 30 s) et émet `error` à chaque échec.
+
+### Options
+
+| Option | Défaut | |
+|---|---|---|
+| `relay` | **obligatoire** | `wss://…`, ou `ws://` seulement sur `localhost` / `127.0.0.1` |
+| `room` | **obligatoire** | nom choisi par l'app, 1 à 64 caractères ; le relay ne le voit jamais |
+| `secret` | **obligatoire** | sortie de `newSecret()` : 32 octets en base64url (43 caractères) |
+| `max` | `8` | peers max, soi compris (≥ 2). Fixé par celui qui **crée** la room, plafonné par le relay |
+| `relayKey` | — | clé d'accès si le relay est privé (`RELAY_KEY`) |
+| `iceServers` | STUN Google | `[]` pour n'utiliser aucun serveur STUN |
+| `fallback` | `true` | si le direct échoue, passer les messages par le relay (chiffrés, plus lents) |
+| `connectMs` | `20000` | délai pour établir le direct avec un peer, avant repli ou abandon |
+| `handshakeMs` | `10000` | délai pour que la preuve du secret aboutisse |
+| `maxMessageBytes` | `1048576` | taille max d'un message envoyé **ou reçu** (1 Mio) |
+
+### Room et Peer
+
+| Membre | |
+|---|---|
+| `room.ready`, `room.id`, `room.isCreator`, `room.max`, `room.peers` | voir [CONTRACT.md](CONTRACT.md#room) |
+| `room.on(event, fn)` | retourne la fonction qui désabonne ; événements `peer`, `leave`, `error`, `close` |
+| `room.broadcast(data)` | envoie à tous les peers prêts |
+| `room.leave()` | quitte, ferme tout ; `close` émis avec `null` |
+| `peer.id`, `peer.via` | `'direct'` (WebRTC) ou `'relay'` (repli) |
+| `peer.send(data)` | `string`, `Uint8Array` ou `ArrayBuffer` ; découpé et recollé au-delà de 16 Ko ; **attend** si la file d'envoi est pleine ; rejette `too-big` / `closed` |
+| `peer.on('message', fn)` | `string` si l'autre a envoyé une chaîne, sinon `Uint8Array` |
+| `peer.on('close', fn)` | `fn(reason)` : `closed` (fermé par l'un ou l'autre), `relay` (peer de repli perdu avec le relay), `peer-rate`, `too-big` |
+| `peer.close()` | coupe ce peer seulement |
+
+Pas de JSON imposé : `peer.send(JSON.stringify(obj))` et `JSON.parse(data)` côté app.
+
+### Partager la room par un lien
+
+```js
+import { formatLink, parseLink } from '@meitogi/signal';
+
+formatLink('https://mon-app.example/', { room: 'partie-du-soir', secret });
+// → https://mon-app.example/#r=partie-du-soir&s=<secret>      (+ &relay=… si donné)
+
+parseLink(location.href); // → { room, secret, relay? } ou null
+```
+
+Tout est après `#` : le navigateur n'envoie jamais cette partie au serveur web.
+
+### Erreurs
+
+Toutes les erreurs sont des `SignalError` avec `code` et `fatal`. Fatal : `room.ready`
+rejette (ou `close` est émis si on était entré). Non fatal : `error` est émis, la room
+continue. Les codes sont ceux de [CONTRACT.md](CONTRACT.md#erreurs) ; voici comment les
+fermetures du relay s'y traduisent (`src/errors.js` porte la même table) :
+
+| Fermeture du relay | `code` | Fatal | |
+|---|---|---|---|
+| 4401 | `key` | oui | `relayKey` absente ou refusée — **ou** `hello` arrivé en retard : indiscernables |
+| 4403 | `room-full` | oui | à l'entrée, et aussi à une reconnexion (la place a été prise pendant l'absence) |
+| 4408 | `relay` | non | silence de 30 s ; les pings toutes les 5 s le rendent rare (machine endormie) ; reconnexion |
+| 4409 | `id-taken` | non | un nouvel id est tiré, reconnexion immédiate |
+| 4429 | `rate` | oui | débit ou trop d'offres — hors d'atteinte par construction (voir Sécurité) |
+| 4400, 1009 | `relay` | **oui** | incompatibilité de protocole ; impossible avec `joinRoom()`, et réessayer compterait comme une faute |
+| HTTP 429 à l'upgrade | `banned` (Node, à l'entrée) · `relay` (Node une fois entré, et toujours dans un navigateur) | selon | ban **ou** plafond de connexions atteint : indiscernables ; un navigateur ne voit pas le statut HTTP |
+| 1006, 1001, 1012, relay injoignable | `relay` | non | reconnexion avec backoff ; `ready` reste en attente tant qu'on n'est jamais entré |
+
+Incidents sur un peer (non fatals, le peer est coupé) : `proof` (preuve ratée, boîte
+illisible ou mensonge sur `kind`, message avant la preuve), `timeout` (preuve ou repli pas
+aboutis à temps ; aussi une offre refusée faute de place : 4 poignées de main en cours, ou
+3 offres déjà envoyées à ce peer dans la minute), `ice` (pas de chemin direct et
+`fallback: false`), `peer-rate`, `too-big` (un peer a dépassé **notre** `maxMessageBytes`).
+
+### Sécurité : ce qui est garanti
+
+1. **Le secret ne quitte jamais l'appareil.** Le relay reçoit `HKDF-SHA256(secret, room)`
+   comme id de room (43 caractères) ; deux groupes de même nom et de secrets différents
+   ne se croisent jamais.
+2. **Tout ce qui passe par le relay est chiffré** (AES-GCM-256, clé dérivée du secret) :
+   offres, réponses, candidats ICE, messages de repli. Les données additionnelles lient
+   room, expéditeur et destinataire ; un compteur par expéditeur refuse les rejeux. Une
+   boîte qui ne s'ouvre pas, est rejouée, ou dont le `kind` scellé ne correspond pas au
+   `kind` en clair est jetée et son expéditeur bloqué (`block`).
+3. **Chaque peer prouve le secret avant tout échange**, par HMAC-SHA256 sur les empreintes
+   DTLS des deux SDP, l'id de room et deux nonces frais : la preuve du répondeur voyage
+   dans sa réponse scellée, celle de l'offrant est le premier message du canal, puis `ok`.
+   `peer` n'est émis qu'à ce `ok`.
+4. **Rien n'est lu avant la preuve.** Sur le canal, avant la preuve, un message binaire,
+   de plus de 1 Ko, ou qui n'est pas la preuve attendue coupe le peer sans être parsé.
+5. **On ne paie rien pour un inconnu.** Aucune `RTCPeerConnection` sans une offre qui se
+   déchiffre ; 4 poignées de main entrantes au plus ; une offre en double est jetée ; le
+   créateur refuse au-delà de `max` ; après la preuve, un peer qui dépasse le débit
+   autorisé est coupé (`peer-rate`) ; notre SDP annonce `a=max-message-size:65536`.
+6. **Le repli par le relay est prouvé par l'enveloppe elle-même.** Sans DTLS, c'est la
+   boîte scellée qui prouve le secret : elle ne s'ouvre qu'avec la clé de la room, ses
+   données additionnelles la lient à l'expéditeur et au destinataire, son compteur la rend
+   non rejouable. Le repli s'ouvre par un `join` scellé (de celui qui offrait) et un `ok`
+   scellé en retour ; les deux côtés obtiennent un peer `via: 'relay'`.
+7. **On reste sous les limites du relay par construction.** Au plus 3 offres par minute
+   vers un même peer (le relay en tolère 6), un seul seau de jetons pour tout ce qui sort
+   (100 messages/s, le relay en tolère 120), des trames de repli de 11 Ko (le relay coupe
+   à 16 Ko), un `ping` toutes les 5 s (le relay coupe après 30 s de silence).
+
+Ce qui reste à l'app : savoir **qui** est le peer au-delà de « il connaît le secret ».
+
+### Réglages avancés
+
+`limits: { peerRate, peerBurst }` règle le plafond de réception par peer (défaut 1000
+trames/s, rafale 2000). Hors contrat : sert aux tests, à ne toucher qu'en connaissance
+de cause.
+
+### Coder avant la publication
+
+Le paquet n'est pas encore sur npm : il est fourni en archive,
+`npm install ./meitogi-signal-0.1.0.tgz`, et rien ne change le jour où il y arrive. Pour
+tester en local : `npx @meitogi/signal` (ou `node bin/signal.js` depuis ce dépôt), puis
+`relay: 'ws://localhost:8787'`. Le relay en ligne `wss://signal.du.ranchchoco.boo` parle
+encore l'ancien protocole ; il passera à la v1 après la sortie du paquet.
+
 ## Lancer un relay
 
 ```
@@ -23,7 +181,8 @@ docker run -d --name signal-relay -p 8787:8787 signal-relay
 Le relay écoute en `ws://` sur le port 8787. Un navigateur exige `wss://` : le
 mettre derrière un reverse proxy ([deploy/](deploy/), plus bas), ou lui donner un
 certificat avec `TLS_CERT` / `TLS_KEY`, et il sert `wss://` lui-même. Node 22 ou
-plus, une seule dépendance (`ws`).
+plus ; le relay lui-même n'a besoin que de `ws` (`werift` ne sert qu'à l'entrée Node du
+client).
 
 | Variable | Défaut | |
 |---|---|---|

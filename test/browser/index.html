@@ -1,0 +1,34 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>@meitogi/signal — browser smoke</title>
+<pre id="log"></pre>
+<script type="module">
+  // Joins the room named by the page's #fragment (formatLink) and echoes every message back with
+  // an `echo:` prefix. Driven over CDP by test/browser/smoke.mjs ; `window.state` is what it reads.
+  import { joinRoom, parseLink, SignalError } from '/src/index.js';
+  const state = (window.state = { ready: false, id: null, isCreator: null, peers: [], received: [], errors: [], closed: undefined, via: null });
+  const out = document.getElementById('log');
+  const log = (line) => { out.textContent += `${line}\n`; };
+  const link = parseLink(location.href);
+  if (!link) {
+    log('no room in the link');
+  } else {
+    const room = joinRoom({ ...link, iceServers: [], connectMs: 8000 });
+    room.on('peer', (peer) => {
+      state.peers.push(peer.id);
+      state.via = peer.via;
+      log(`peer ${peer.id} via ${peer.via}`);
+      peer.on('message', async (data) => {
+        const text = typeof data === 'string' ? data : `bytes:${Array.from(data).join(',')}`;
+        state.received.push(text);
+        log(`<- ${text}`);
+        await peer.send(typeof data === 'string' ? `echo:${data}` : new Uint8Array([...data].reverse()));
+      });
+    });
+    room.on('leave', (peer, reason) => log(`leave ${peer.id} ${reason}`));
+    room.on('error', (e) => { state.errors.push(e.code); log(`error ${e.code} ${e.message}`); });
+    room.on('close', (e) => { state.closed = e ? e.code : null; log(`close ${state.closed}`); });
+    room.ready.then(() => { state.ready = true; state.id = room.id; state.isCreator = room.isCreator; log(`ready ${room.id}`); }, (e) => log(`ready rejected ${e.code}`));
+    window.signalErrorOk = SignalError.name === 'SignalError';
+  }
+</script>

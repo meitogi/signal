@@ -168,6 +168,16 @@ Toutes les erreurs sont des `SignalError` avec un `code` :
 
 « Fatal » : `room.ready` est rejetée (ou `close` émis si on était déjà entré).
 
+Deux précisions issues de l'implémentation :
+
+- `relay` est **fatal** dans deux cas qui ne peuvent pas se produire avec `joinRoom()`
+  (codes de fermeture 4400 et 1009 : incompatibilité de protocole ; réessayer ne servirait
+  à rien et compterait comme une faute pour le relay).
+- `banned` n'est observable que côté Node, et seulement à l'entrée : un navigateur ne voit
+  pas le statut HTTP 429 (il reçoit `relay`, non fatal, et la room réessaie) ; une fois dans
+  la room, un 429 à la reconnexion est aussi `relay`. Le tableau complet des codes de
+  fermeture est dans le README du paquet.
+
 ## Sécurité : ce qui est garanti
 
 1. **Le secret ne quitte jamais l'appareil.** Le relay reçoit l'id de room
@@ -263,3 +273,6 @@ un HTTP 429 avant même le WebSocket.
   boîte ; nouveau code de fermeture 4408 (silence après le `hello`) ; `creator`
   du `welcome` est un booléen et `peers` inclut soi ; `TRUST_PROXY` accepte une
   liste ; `TLS_WATCH_MS` et `RELAY_LOG_DATA` ajoutées au tableau. Rien ne change pour l'app : `joinRoom()` parle ce protocole.
+- 2026-10-23 — client : `relay` est fatal sur les fermetures 4400 et 1009 (incompatibilité
+  de protocole) ; `banned` n'est observable que côté Node, à l'entrée. Rien ne change pour
+  l'app.

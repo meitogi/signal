@@ -9,11 +9,19 @@
     "type": "git",
     "url": "git+https://github.com/meitogi/signal.git"
   },
-  "keywords": ["webrtc", "signaling", "relay", "websocket", "rooms"],
+  "keywords": [
+    "webrtc",
+    "signaling",
+    "relay",
+    "websocket",
+    "rooms"
+  ],
   "bin": {
     "signal": "bin/signal.js"
   },
   "exports": {
+    ".": "./src/index.js",
+    "./node": "./src/node.js",
     "./relay": "./src/relay.js",
     "./package.json": "./package.json"
   },
@@ -35,6 +43,7 @@
     "test": "node --test --test-timeout=60000 test/*.test.js"
   },
   "dependencies": {
+    "werift": "^0.25.1",
     "ws": "^8.22.0"
   }
 }
