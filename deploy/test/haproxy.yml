@@ -1,0 +1,16 @@
+# Test overlay : HAProxy with a minimal HTTPS frontend and the kit's signal-relay.cfg.
+services:
+  haproxy:
+    image: haproxy:3.4.7-alpine
+    command: [haproxy, -f, /usr/local/etc/haproxy/haproxy.cfg, -f, /usr/local/etc/haproxy/signal-relay.cfg]
+    environment:
+      RELAY_DOMAIN: ${RELAY_DOMAIN}
+    volumes:
+      - ${TEST_DIR}/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ${TEST_DIR}/../haproxy/signal-relay.cfg:/usr/local/etc/haproxy/signal-relay.cfg:ro
+      - ${TEST_DIR}/.tmp/relay.pem:/certs/relay.pem:ro
+    depends_on:
+      signal-relay: { condition: service_healthy }
+    networks:
+      proxy:
+        aliases: [relay.test]

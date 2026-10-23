@@ -1,0 +1,33 @@
+# @meitogi/signal relay behind an existing Traefik (docker provider) : the labels are the whole snippet.
+#   docker compose --env-file ../.env -p signal-relay up -d --build
+# Two middlewares refuse floods per client IP before they reach the relay : inFlightReq caps the
+# open WebSockets (a WebSocket stays in flight while open), rateLimit caps new connections.
+services:
+  signal-relay:
+    build: ../..
+    image: signal-relay
+    restart: unless-stopped
+    environment:
+      RELAY_KEY: ${RELAY_KEY:-}
+      TRUST_PROXY: ${TRUST_PROXY:-}
+      RELAY_LEGACY: ${RELAY_LEGACY:-0}
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=${PROXY_NETWORK}
+      - traefik.http.routers.signal-relay.rule=Host(`${RELAY_DOMAIN}`)
+      - traefik.http.routers.signal-relay.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}
+      - traefik.http.routers.signal-relay.tls=true
+      - traefik.http.routers.signal-relay.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}
+      - traefik.http.routers.signal-relay.middlewares=signal-relay-inflight,signal-relay-rate
+      - traefik.http.middlewares.signal-relay-inflight.inflightreq.amount=${TRAEFIK_INFLIGHT:-10}
+      - traefik.http.middlewares.signal-relay-inflight.inflightreq.sourcecriterion.ipstrategy.depth=0
+      - traefik.http.middlewares.signal-relay-rate.ratelimit.average=${TRAEFIK_RATE:-5}
+      - traefik.http.middlewares.signal-relay-rate.ratelimit.burst=${TRAEFIK_RATE_BURST:-20}
+      - traefik.http.middlewares.signal-relay-rate.ratelimit.sourcecriterion.ipstrategy.depth=0
+      - traefik.http.services.signal-relay.loadbalancer.server.port=8787
+    networks: [proxy]
+
+networks:
+  proxy:
+    external: true
+    name: ${PROXY_NETWORK}

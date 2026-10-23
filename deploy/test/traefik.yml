@@ -1,0 +1,17 @@
+# Test overlay : a Traefik like the one the kit expects, listening on the test network only.
+services:
+  traefik:
+    image: traefik:v3.7.16
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.constraints=Label(`com.docker.compose.project`,`${COMPOSE_PROJECT_NAME}`)
+      - --entrypoints.websecure.address=:443
+      - --certificatesresolvers.letsencrypt.acme.storage=/tmp/acme.json
+      - --certificatesresolvers.letsencrypt.acme.tlschallenge=true
+      - --certificatesresolvers.letsencrypt.acme.caserver=https://127.0.0.1:1/directory
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      proxy:
+        aliases: [relay.test]

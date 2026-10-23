@@ -1,0 +1,6 @@
+# Test-only main Caddyfile : stands for the user's own.
+{
+	local_certs
+}
+
+import /etc/caddy/relay.caddy

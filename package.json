@@ -1,0 +1,40 @@
+{
+  "name": "@meitogi/signal",
+  "version": "0.1.0",
+  "description": "Rooms of devices sharing a secret, meeting through a WebSocket relay that can neither read, join nor impersonate them.",
+  "type": "module",
+  "license": "MIT",
+  "author": "meitogi",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/meitogi/signal.git"
+  },
+  "keywords": ["webrtc", "signaling", "relay", "websocket", "rooms"],
+  "bin": {
+    "signal": "bin/signal.js"
+  },
+  "exports": {
+    "./relay": "./src/relay.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "README.md",
+    "CONTRACT.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "start": "node bin/signal.js",
+    "test": "node --test --test-timeout=60000 test/*.test.js"
+  },
+  "dependencies": {
+    "ws": "^8.22.0"
+  }
+}

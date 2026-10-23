@@ -1,0 +1,5 @@
+# @meitogi/signal relay site for Caddy 2 — in your Caddyfile : import /path/to/relay.caddy
+# Caddy gets the certificate, proxies WebSockets and sets X-Forwarded-For with no extra directive.
+{$RELAY_DOMAIN} {
+	reverse_proxy signal-relay:8787
+}

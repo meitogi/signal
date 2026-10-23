@@ -1,0 +1,12 @@
+# Test overlay : Caddy with its internal CA (no ACME) importing the kit's relay.caddy.
+services:
+  caddy:
+    image: caddy:2.11.7-alpine
+    environment:
+      RELAY_DOMAIN: ${RELAY_DOMAIN}
+    volumes:
+      - ${TEST_DIR}/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${TEST_DIR}/../caddy/relay.caddy:/etc/caddy/relay.caddy:ro
+    networks:
+      proxy:
+        aliases: [relay.test]

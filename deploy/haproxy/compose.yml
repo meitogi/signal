@@ -1,0 +1,18 @@
+# @meitogi/signal relay behind an existing HAProxy : the relay joins the proxy's network as `signal-relay`,
+# signal-relay.cfg adds the backend, and one line in your HTTPS frontend routes to it.
+#   docker compose --env-file ../.env -p signal-relay up -d --build
+services:
+  signal-relay:
+    build: ../..
+    image: signal-relay
+    restart: unless-stopped
+    environment:
+      RELAY_KEY: ${RELAY_KEY:-}
+      TRUST_PROXY: ${TRUST_PROXY:-}
+      RELAY_LEGACY: ${RELAY_LEGACY:-0}
+    networks: [proxy]
+
+networks:
+  proxy:
+    external: true
+    name: ${PROXY_NETWORK}
