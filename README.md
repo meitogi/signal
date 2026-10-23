@@ -270,6 +270,10 @@ avec son proxy dans Docker et vérifie, à travers lui, la connexion `wss://`, l
 clé, le transfert, le délai du `hello`, le plafond par IP, et que le relay voit
 bien l'IP du client.
 
+Une fois en ligne, `node deploy/test/live-room.mjs wss://relay.example.org` fait
+entrer deux peers Node dans une room à travers lui et échanger un message dans
+chaque sens.
+
 ### La clé d'accès
 
 Avec `RELAY_KEY`, le premier message d'une connexion doit être son `hello`, avec
