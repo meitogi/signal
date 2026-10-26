@@ -1,3 +1,4 @@
 node_modules/
 *.tgz
 deploy/test/.tmp/
+deploy/test/results/

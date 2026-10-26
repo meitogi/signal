@@ -20,6 +20,11 @@
 //   ICE=none    `iceServers: []` (loopback ; werift still asks its built-in STUN server) ; EXPECT_DIRECT=1 : no direct path fails the run
 //   WAIT_MS (180000) for the second peer ; BIG_BYTES (1000000) ; FLOW_BYTES (4000000) relay throughput
 //   CADENCE=0 ; RATES (30,60,120) ; LEG_MS (10000) per leg ; LATE_MS (100) ; BENCH_JSON=<file> : results as JSON
+//   Each run is saved in BENCH_DIR (default deploy/test/results/, gitignored : it holds public IPs) as
+//   <date>_<device>_<network>.json + .txt (the whole output), with one row appended to results.md.
+//   The device comes from the peer's user agent (Brave through navigator.brave), the network from
+//   navigator.connection when the browser has it, else from the peer's public IP against this machine's
+//   (same-net / other-net). DEVICE=… and NET=… (e.g. NET=4g) override them ; BENCH_SAVE=0 saves nothing.
 // One PASS / FAIL line per assertion, INFO for reported facts ; exit 0 = no FAIL. A direct path that does
 // not come up is INFO — a symmetric NAT (Orange 4G) is a result, not a bug — unless EXPECT_DIRECT=1.
 //
@@ -27,7 +32,8 @@
 // `report` → `{"bench":"report", via, lib, ua, local, remote, pair, received, echoed}`, `summary` → lines
 // to show ; any other text comes back as `echo:<text>`, any bytes come back reversed.
 import { execFileSync } from 'node:child_process';
-import { createReadStream, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { reverse } from 'node:dns/promises';
+import { appendFileSync, createReadStream, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { register } from 'node:module';
 import { dirname, join, normalize } from 'node:path';
@@ -69,6 +75,10 @@ const PACKET = 16;
 const ROOM = 'bench';
 const RELAY_ROOM = 'bench-relay';
 
+// Everything printed is kept for the saved .txt.
+const transcript = [];
+const print = console.log;
+console.log = (...args) => { transcript.push(args.join(' ')); print(...args); };
 const say = (line) => console.log(`[bench] ${line}`);
 let failed = 0;
 const results = { scenarios: {}, cadence: [] };
@@ -182,6 +192,68 @@ function sameLibrary(lib) {
     info(`library : peer @${sha.slice(0, 7)} ; cannot compare here (no git, or commit ${sha.slice(0, 7)} unknown locally)`);
     return true;
   }
+}
+
+// ── who the peer is, on which network ────────────────────────────────────────────────────────────
+
+/** `ios-18.7-safari-18.7`, `macos-brave`, `macos-firefox-131`… from the user agent the peer reported. */
+function clientName(report) {
+  const ua = report.ua ?? '';
+  if (ua.startsWith('node ')) return { os: process.platform, browser: 'node', label: env.DEVICE || 'node' };
+  let m;
+  let os = 'unknown';
+  if ((m = /(iPhone|iPad)[^)]*OS (\d+)[_.](\d+)/.exec(ua))) os = `${m[1] === 'iPad' ? 'ipados' : 'ios'}-${m[2]}.${m[3]}`;
+  else if ((m = /Android (\d+(?:\.\d+)?)/.exec(ua))) os = `android-${m[1]}`;
+  else if (/Macintosh|Mac OS X/.test(ua)) os = 'macos';
+  else if (/Windows/.test(ua)) os = 'windows';
+  else if (/Linux/.test(ua)) os = 'linux';
+  let browser = 'unknown';
+  if (report.client?.brave) browser = 'brave'; // Brave's user agent is Chrome's
+  else if ((m = /(?:Firefox|FxiOS)\/(\d+)/.exec(ua))) browser = `firefox-${m[1]}`;
+  else if ((m = /(?:EdgiOS|EdgA|Edg)\/(\d+)/.exec(ua))) browser = `edge-${m[1]}`;
+  else if ((m = /(?:CriOS|Chrome)\/(\d+)/.exec(ua))) browser = `chrome-${m[1]}`;
+  else if ((m = /Version\/(\d+(?:\.\d+)?).*Safari/.exec(ua))) browser = `safari-${m[1]}`;
+  return { os, browser, label: env.DEVICE || `${os}-${browser}` };
+}
+
+/** Wi-Fi or cellular when the browser says so (navigator.connection, Chromium on Android), else a guess from public IPs. */
+async function networkGuess(report, mine) {
+  const publicIps = (list) => list.filter((c) => c.startsWith('srflx ')).map((c) => c.split(' ')[1].replace(/:\d+$/, '')).filter((v, i, a) => a.indexOf(v) === i);
+  const peerPublic = publicIps(report.local ?? []);
+  const nodePublic = publicIps(mine.local);
+  const reverseDns = [];
+  for (const ip of peerPublic) reverseDns.push(...(await Promise.race([reverse(ip).catch(() => []), sleep(2000).then(() => [])])));
+  const c = report.client?.connection ?? null;
+  let guess = 'unknown';
+  let source = 'the peer reported no public (srflx) candidate';
+  if (c?.type) { guess = c.type; source = 'navigator.connection.type'; }
+  else if (peerPublic.some((ip) => nodePublic.includes(ip))) { guess = 'same-net'; source = 'same public IP as this machine (same Wi-Fi / LAN)'; }
+  else if (peerPublic.length) { guess = 'other-net'; source = 'public IP differs from this machine (cellular, or another network)'; }
+  return { label: env.NET || guess, guess, source, peerPublic, nodePublic, reverseDns, connection: c };
+}
+
+function save() {
+  const dir = env.BENCH_DIR || join(HERE, 'results');
+  mkdirSync(dir, { recursive: true });
+  const slug = (text) => String(text).toLowerCase().replace(/[^a-z0-9.]+/g, '-').replace(/^-|-$/g, '');
+  const stamp = new Date().toISOString().slice(0, 16).replace('T', '_').replace(':', '');
+  const base = join(dir, `${stamp}_${slug(results.client?.label ?? 'no-peer')}_${slug(results.network?.label ?? 'unknown')}`);
+  writeFileSync(`${base}.json`, JSON.stringify(results, null, 2));
+  writeFileSync(`${base}.txt`, `${transcript.join('\n')}\n`);
+  const index = join(dir, 'results.md');
+  if (!existsSync(index)) {
+    appendFileSync(index, '| date (UTC) | device | network | direct | pair (node side) | relay MB/s | relay 60 Hz p50 / p95 | direct 60 Hz p50 / p95 | result |\n|---|---|---|---|---|---|---|---|---|\n');
+  }
+  const leg = (path) => results.cadence.find((l) => l.path === path && l.rate === 60 && !l.batch);
+  const rtt = (l) => (l ? `${l.p50.toFixed(1)} / ${l.p95.toFixed(1)} ms` : '—');
+  const s = results.scenarios;
+  const cells = [
+    stamp.replace('_', ' '), results.client?.label ?? '—', results.network ? `${results.network.label} (${results.network.source})` : '—',
+    s.direct?.via ?? '—', s.direct?.node.pair ?? '—', s.relay?.mbPerS ?? '—', rtt(leg('relay')), rtt(leg('direct')),
+    results.error ? `FAIL : ${results.error}` : results.failed ? `FAIL × ${results.failed}` : 'PASS',
+  ];
+  appendFileSync(index, `| ${cells.join(' | ')} |\n`);
+  print(`[bench] saved ${base}.json and .txt ; row added to ${index}`);
 }
 
 // ── the responder (PEER=node) : the page's bench mode, in node ───────────────────────────────────
@@ -368,6 +440,11 @@ try {
   const theirs = await askReport(d);
   results.scenarios.direct = { via: d.peer.via, peerVia: theirs.via, node: mine, peer: { local: theirs.local, remote: theirs.remote, pair: theirs.pair, ua: theirs.ua } };
   info(`peer : ${theirs.ua}`);
+  results.client = clientName(theirs);
+  results.network = await networkGuess(theirs, mine);
+  info(`device : ${results.client.label}${env.DEVICE ? ' (DEVICE)' : ''} ; network : ${results.network.label}${env.NET ? ' (NET)' : ''} — ${results.network.source}`);
+  if (results.network.connection) info(`  navigator.connection : ${JSON.stringify(results.network.connection)} (effectiveType is a speed class, not the radio : « 4g » on a fast Wi-Fi too)`);
+  if (results.network.peerPublic.length) info(`  peer public ${results.network.peerPublic.join(', ')}${results.network.reverseDns.length ? ` (${results.network.reverseDns.join(', ')})` : ''} ; this machine ${results.network.nodePublic.join(', ') || 'none'}`);
   sameLibrary(theirs.lib);
   for (const c of mine.local) info(`node local  ${c}`);
   for (const c of mine.remote) info(`node remote ${c}`);
@@ -471,6 +548,7 @@ try {
   results.error = e.message;
 } finally {
   if (env.BENCH_JSON) writeFileSync(env.BENCH_JSON, JSON.stringify(results, null, 2));
+  if (env.BENCH_SAVE !== '0') save();
   await sleep(500); // the summary reaches the page
   for (const key in rooms) rooms[key].room.leave();
   for (const o of others) o.leave();

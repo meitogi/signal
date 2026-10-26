@@ -282,7 +282,10 @@ arrivant entre avec `connectMs: 1`) et son débit, les échos texte et octets, u
 gros message fragmenté sur chaque chemin, et mesure une cadence de jeu (paquets
 à 30 / 60 / 120 Hz, avec ou sans regroupement par tick de 20 ms : RTT, gigue,
 pertes). À lancer en natif (pas dans un conteneur Docker Desktop, qui n'a pas de
-chemin direct) ; les options sont en tête du fichier.
+chemin direct) ; les options sont en tête du fichier. Chaque passage est enregistré dans
+`deploy/test/results/` (ignoré par git : il contient des IP publiques) au nom de l'appareil et du
+réseau (`ios-18.7-safari-18.7_other-net`, `macos-brave_same-net`…), avec une ligne de plus dans
+`results.md` pour comparer les passages.
 
 ### La clé d'accès
 
