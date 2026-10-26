@@ -274,6 +274,16 @@ Une fois en ligne, `node deploy/test/live-room.mjs wss://relay.example.org` fait
 entrer deux peers Node dans une room à travers lui et échanger un message dans
 chaque sens.
 
+`node deploy/test/bench.mjs` est le banc de connectivité complet : il affiche un
+lien vers la [page de test](https://github.com/meitogi/signal-test-page) (à ouvrir
+sur un téléphone, en 4G ou sur le même Wi-Fi), puis vérifie des deux côtés le
+chemin direct (candidats, paire choisie), le repli par le relay forcé (le second
+arrivant entre avec `connectMs: 1`) et son débit, les échos texte et octets, un
+gros message fragmenté sur chaque chemin, et mesure une cadence de jeu (paquets
+à 30 / 60 / 120 Hz, avec ou sans regroupement par tick de 20 ms : RTT, gigue,
+pertes). À lancer en natif (pas dans un conteneur Docker Desktop, qui n'a pas de
+chemin direct) ; les options sont en tête du fichier.
+
 ### La clé d'accès
 
 Avec `RELAY_KEY`, le premier message d'une connexion doit être son `hello`, avec
@@ -320,6 +330,7 @@ Les options reprennent les variables ci-dessus (`roomMax`, `maxBytes`, `helloMs`
 ```
 npm ci && npm test        # protocole, ancien protocole, floods, bans, TLS
 deploy/test/run.sh        # les trois kits de proxy, dans Docker
+PEER=node RELAY=local node deploy/test/bench.mjs   # le banc, deux peers Node en local
 ```
 
 ## Licence
