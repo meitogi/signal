@@ -4,7 +4,7 @@ Ce document décrit ce que fait le paquet `@meitogi/signal`, assez précisément
 écrire le code d'une application contre lui. Si un point change, ce document change
 avec, et la ligne « Changements » en bas le dit.
 
-> **Statut** : utilisable, version 0.1.0, installée depuis GitHub (pas encore sur npm, voir
+> **Statut** : utilisable, version 0.1.1, installée depuis GitHub (pas encore sur npm, voir
 > « Installer »). Le relay en ligne `wss://signal.du.ranchchoco.boo` parle ce protocole et
 > demande une clé par application.
 
@@ -25,7 +25,7 @@ personne d'autre ne puisse lire, entrer ou se faire passer pour l'un d'eux.
 ## Installer
 
 ```
-npm install github:meitogi/signal#v0.1.0
+npm install github:meitogi/signal#v0.1.1
 ```
 
 En attendant sa publication sur npm, le paquet s'installe depuis son dépôt, épinglé sur un tag :
@@ -374,7 +374,7 @@ un HTTP 429 avant même le WebSocket.
   ses anciens clients) et demande une `relayKey` : une par application, donnée par son exploitant.
   Une clé refusée est une faute pour le relay (`key`, fatale, la room ne réessaie pas) : cinq en
   10 min bannissent l'IP. Ne pas boucler sur `joinRoom()` après un `key`.
-- Pour tester sans clé, lancer un relay local (`npx github:meitogi/signal#v0.1.0`, puis
+- Pour tester sans clé, lancer un relay local (`npx github:meitogi/signal#v0.1.1`, puis
   `relay: 'ws://localhost:8787'`).
 
 ## Changements
@@ -399,3 +399,6 @@ un HTTP 429 avant même le WebSocket.
   ligne parle la v1 avec des clés. Relay : un refus au plafond par IP (`RELAY_IP_CONN`) n'est plus
   une faute vers un ban. Nouvelles sections « Plusieurs rooms à la fois » et « Repli par le
   relay ». Rien ne change pour l'app.
+- 2026-10-27 — 0.1.1, client : le créateur d'une room ne compte plus la négociation directe
+  qu'un peer abandonne quand ce peer se replie par le relay ; une room à `max: 2` acceptait
+  mal ce repli (`room-full` d'un côté, `timeout` de l'autre). Rien ne change pour l'app.

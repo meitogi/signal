@@ -112,6 +112,27 @@ test('fallback : no direct path → both get a relay peer, messages flow sealed 
   }
 });
 
+test('fallback in a max-2 room : the creator still holding its handshake admits the relay join', { timeout: 30_000 }, async () => {
+  const relay = await startRelay();
+  const options = fresh(urlOf(relay), { max: 2 });
+  const a = joinWith(brokenIce())({ ...options, connectMs: 20_000 });
+  await a.ready;
+  const errorsA = collect(a, 'error');
+  const b = joinWith(brokenIce())({ ...options, connectMs: 200 });
+  const errorsB = collect(b, 'error');
+  await b.ready;
+  try {
+    await waitFor(() => (a.peers.length === 1 && b.peers.length === 1) || errorsA.length > 0, 10_000, 'relay peers');
+    assert.deepEqual(errorsA.map((e) => e.message), []);
+    assert.equal(a.peers[0].via, 'relay');
+    assert.equal(b.peers[0].via, 'relay');
+    assert.deepEqual(errorsB.map((e) => e.message), []);
+  } finally {
+    leaveAll([a, b]);
+    await relay.close();
+  }
+});
+
 test('fallback: false → error ice, no peer', { timeout: 20_000 }, async () => {
   const relay = await startRelay();
   const options = fresh(urlOf(relay), { connectMs: 1000, fallback: false });

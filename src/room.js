@@ -361,9 +361,12 @@ export function createClient(platform) {
           if (peer.via === 'relay') session.data(from, new Uint8Array([TAG.ok])); // our ok was lost : again
           return;
         }
-        if (!roomHasRoom()) return incident('room-full', `relay join from ${from} dropped : room at max ${room.max}`);
+        // What we hold for `from` is superseded by its join : torn down first, or it counts against `max`.
         const h = handshakes[from];
         if (h !== undefined) fail(h, null); // the offerer gave up on the direct path
+        const timer = relayJoins[from];
+        if (timer !== undefined) { clearTimeout(timer); delete relayJoins[from]; } // our joins crossed : theirs wins
+        if (!roomHasRoom()) return incident('room-full', `relay join from ${from} dropped : room at max ${room.max}`);
         session.data(from, new Uint8Array([TAG.ok]));
         relayPeer(from);
       } else if (tag === TAG.ok) {
