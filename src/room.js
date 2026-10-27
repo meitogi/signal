@@ -9,6 +9,11 @@
 // each side reads exactly one text message of at most PRE_PROOF_MAX bytes of the expected shape ;
 // anything else closes the connection without being parsed.
 //
+// Both sides also create the UNRELIABLE channel with the connection (pre-negotiated : no in-band open,
+// nothing for the other side to announce). Nothing listens to it before the peer is ready, so what
+// arrives earlier is discarded unread — not a cut : channels are not ordered between each other, and an
+// honest answerer's first packet may overtake its own `ok`. Any other channel a peer opens is closed.
+//
 // Fallback through the relay (`fallback: true`) : when the direct path fails on the offerer's side it
 // sends a sealed `data` frame `join` ; the target drops any direct attempt with it, answers `ok`, and
 // both get a `via: 'relay'` peer. The proof there is the envelope itself : a `data` box only opens
@@ -22,6 +27,8 @@ import { createRelaySession } from './relay-session.js';
 import { capMessageSize, transcript } from './sdp.js';
 
 export const STUN = [{ urls: 'stun:stun.l.google.com:19302' }];
+/** The second channel, for `send(data, { reliable: false })` : unordered, never retransmitted. */
+export const UNRELIABLE = { label: 'unreliable', options: { negotiated: true, id: 2, ordered: false, maxRetransmits: 0 } };
 /** Largest pre-proof message read on a channel ; above it, the peer is cut unread. */
 const PRE_PROOF_MAX = 1024;
 /** Inbound handshakes allowed at once : a stranger with the room id cannot make us open more. */
@@ -33,6 +40,12 @@ const OFFER_WINDOW_MS = 60_000;
 const RELAY_CHUNK = 11 * 1024;
 const TAG = { msg: 0, join: 1, ok: 2, bye: 3 };
 const LOCAL_HOSTS = { localhost: true, '127.0.0.1': true };
+
+/**
+ * Closes a channel the other side opened beyond ours, once its `datachannel` event is over : werift
+ * fires the event before it has registered and acknowledged the channel, and a close inside it breaks both.
+ */
+const refuse = (channel) => setTimeout(() => channel.close(), 0);
 
 function validate(o) {
   if (o === null || typeof o !== 'object') return new SignalError('options', 'joinRoom() takes an options object');
@@ -48,7 +61,7 @@ function validate(o) {
   if (!Number.isInteger(max) || max < 2) return new SignalError('options', '`max` must be an integer ≥ 2');
   if (o.relayKey !== undefined && typeof o.relayKey !== 'string') return new SignalError('options', '`relayKey` must be a string');
   if (o.iceServers !== undefined && !Array.isArray(o.iceServers)) return new SignalError('options', '`iceServers` must be an array');
-  for (const name of ['connectMs', 'handshakeMs', 'maxMessageBytes']) {
+  for (const name of ['connectMs', 'handshakeMs', 'maxMessageBytes', 'sendRate', 'sendBurst']) {
     const v = o[name];
     if (v !== undefined && !(Number.isInteger(v) && v > 0)) return new SignalError('options', `\`${name}\` must be a positive integer`);
   }
@@ -101,7 +114,7 @@ export function createClient(platform) {
     }
     const {
       relay, room: roomName, secret, relayKey, iceServers = STUN, fallback = true,
-      connectMs = 20_000, handshakeMs = 10_000, maxMessageBytes = 1_048_576, limits,
+      connectMs = 20_000, handshakeMs = 10_000, maxMessageBytes = 1_048_576, sendRate, sendBurst, limits,
     } = options;
     const max = options.max ?? 8;
     let roomId = null;
@@ -203,12 +216,12 @@ export function createClient(platform) {
     function ready(h) {
       if (h.done) return;
       finish(h);
-      adopt(directPeer({ id: h.id, pc: h.pc, channel: h.channel, maxMessageBytes, limits }));
+      adopt(directPeer({ id: h.id, pc: h.pc, channel: h.channel, unreliable: h.unreliable, maxMessageBytes, limits }));
     }
 
     function newHandshake(id, role) {
       const pc = new RTCPeerConnection({ iceServers });
-      const h = { id, role, pc, channel: null, offerSdp: null, answerSdp: null, roomId, offerNonce: null, answerNonce: null, remoteSet: false, ice: [], connectTimer: null, handshakeTimer: null, done: false };
+      const h = { id, role, pc, channel: null, unreliable: null, offerSdp: null, answerSdp: null, roomId, offerNonce: null, answerNonce: null, remoteSet: false, ice: [], connectTimer: null, handshakeTimer: null, done: false };
       handshakes[id] = h;
       if (role === 'answerer') inbound++;
       h.connectTimer = setTimeout(() => fail(h, 'ice', `no direct path to ${id} within ${connectMs} ms`), connectMs);
@@ -220,6 +233,13 @@ export function createClient(platform) {
         if (state === 'failed' || state === 'closed') fail(h, 'ice', `no direct path to ${id} (${state})`);
       });
       return h;
+    }
+
+    /** Our side of the pre-negotiated channel ; read only once the peer is ready (directPeer). */
+    function openUnreliable(h) {
+      const channel = h.pc.createDataChannel(UNRELIABLE.label, UNRELIABLE.options);
+      channel.binaryType = 'arraybuffer';
+      h.unreliable = channel;
     }
 
     function allowOffer(id) {
@@ -240,6 +260,8 @@ export function createClient(platform) {
           if (msg.t !== 'ok') throw new Error('expected ok after our proof');
           ready(h);
         });
+        openUnreliable(h);
+        pc.addEventListener('datachannel', ({ channel }) => refuse(channel)); // the offerer opens every channel
         const offer = await pc.createOffer();
         const sdp = capMessageSize(offer.sdp);
         h.offerSdp = sdp;
@@ -263,7 +285,7 @@ export function createClient(platform) {
       h.offerSdp = inner.sdp;
       h.offerNonce = inner.nonce;
       pc.addEventListener('datachannel', ({ channel }) => {
-        if (h.channel !== null) return;
+        if (h.channel !== null) return refuse(channel);
         gate(h, channel, async (msg) => {
           if (msg.t !== 'proof' || !(await verifyMac(keys.auth, transcript('offerer', h), msg.proof))) throw new Error('did not prove the room secret over these DTLS fingerprints');
           if (h.done) return;
@@ -274,6 +296,7 @@ export function createClient(platform) {
       try {
         await pc.setRemoteDescription({ type: 'offer', sdp: inner.sdp });
         h.remoteSet = true;
+        openUnreliable(h);
         for (const c of h.ice) pc.addIceCandidate(c).catch(() => {});
         h.ice = [];
         const answer = await pc.createAnswer();
@@ -405,7 +428,7 @@ export function createClient(platform) {
       if (ended) return;
       keys = derived;
       roomId = derived.roomId;
-      session = createRelaySession({ WebSocket, url: relay, roomId, max, key: relayKey, seal: keys.seal });
+      session = createRelaySession({ WebSocket, url: relay, roomId, max, key: relayKey, sendRate, sendBurst, seal: keys.seal });
       room.id = session.id;
       session.on('welcome', onWelcome);
       session.on('peers', onPeers);

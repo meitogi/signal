@@ -22,10 +22,10 @@ describe('open relay', () => {
   test('hello → welcome {peers, max, creator} ; peers broadcast with ids only', async () => {
     const room = roomId();
     const a = await join(url, { v: 1, id: 'a1', room, max: 4 });
-    assert.deepEqual(a.welcome, { type: 'welcome', peers: [{ id: 'a1' }], max: 4, creator: true });
+    assert.deepEqual(a.welcome, { type: 'welcome', peers: [{ id: 'a1' }], max: 4, creator: true, rate: 120, burst: 240 });
     await a.next('peers');
     const b = await join(url, { v: 1, id: 'b1', room });
-    assert.deepEqual(b.welcome, { type: 'welcome', peers: [{ id: 'a1' }, { id: 'b1' }], max: 4, creator: false });
+    assert.deepEqual(b.welcome, { type: 'welcome', peers: [{ id: 'a1' }, { id: 'b1' }], max: 4, creator: false, rate: 120, burst: 240 });
     assert.deepEqual((await a.next('peers')).list, [{ id: 'a1' }, { id: 'b1' }]);
     b.close();
     assert.deepEqual((await a.next('peers')).list, [{ id: 'a1' }]);

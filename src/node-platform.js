@@ -1,5 +1,11 @@
 // Node's platform : werift's RTCPeerConnection behind the W3C surface the core uses, and a `ws`
 // WebSocket that remembers the HTTP status of a refused upgrade (a browser socket never sees it).
+//
+// werift asks its built-in STUN server (stun.l.google.com) when given none, and has no option against
+// it : with `iceServers: []` the ICE connections' `stunServer` is cleared before they gather, so no
+// srflx candidate and no STUN request (test/node-platform.test.js pins it).
+// werift 0.25's sender never abandons a `maxRetransmits: 0` message : the unreliable channel is unordered
+// but retransmitted when Node sends ; a browser sender drops lost messages.
 import { RTCPeerConnection as WeriftPeerConnection } from 'werift';
 import WebSocket from 'ws';
 import { MAX_MESSAGE_SIZE } from './sdp.js';
@@ -56,6 +62,10 @@ class NodeDataChannel extends Target {
   }
 
   get label() { return this.#dc.label; }
+  get id() { return this.#dc.id; }
+  get negotiated() { return this.#dc.negotiated; }
+  get ordered() { return this.#dc.ordered; }
+  get maxRetransmits() { return this.#dc.maxRetransmits; }
   get readyState() { return this.#dc.readyState; }
   get bufferedAmount() { return this.#dc.bufferedAmount; }
   get bufferedAmountLowThreshold() { return this.#dc.bufferedAmountLowThreshold; }
@@ -72,11 +82,13 @@ class NodeDataChannel extends Target {
 
 export class NodePeerConnection extends Target {
   #pc;
+  #noStun;
 
   constructor({ iceServers = [] } = {}) {
     super();
     const pc = new WeriftPeerConnection({ iceServers, maxMessageSize: MAX_MESSAGE_SIZE });
     this.#pc = pc;
+    this.#noStun = iceServers.length === 0;
     this._bind('icecandidate', pc.onIceCandidate, (c) => ({ candidate: c ? c.toJSON() : null }));
     this._bind('connectionstatechange', pc.connectionStateChange, () => ({}));
     this._bind('datachannel', pc.onDataChannel, (dc) => ({ channel: new NodeDataChannel(dc) }));
@@ -89,7 +101,11 @@ export class NodePeerConnection extends Target {
   createDataChannel(label, options) { return new NodeDataChannel(this.#pc.createDataChannel(label, options)); }
   createOffer() { return this.#pc.createOffer(); }
   createAnswer() { return this.#pc.createAnswer(); }
-  setLocalDescription(desc) { return this.#pc.setLocalDescription(desc); }
+  setLocalDescription(desc) {
+    // Gathering starts here : the transports exist (createDataChannel / setRemoteDescription made them).
+    if (this.#noStun) for (const transport of this.#pc.iceTransports) transport.iceGather.connection.stunServer = undefined;
+    return this.#pc.setLocalDescription(desc);
+  }
   setRemoteDescription(desc) { return this.#pc.setRemoteDescription(desc); }
   addIceCandidate(candidate) { return this.#pc.addIceCandidate(candidate); }
   close() { this.#pc.close().catch(() => {}); }

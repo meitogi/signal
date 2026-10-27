@@ -75,11 +75,15 @@ import { formatLink, parseLink } from '@meitogi/signal';
 
 formatLink('https://mon-app.example/', { room: 'partie-du-soir', secret });
 // → https://mon-app.example/#r=partie-du-soir&s=<secret>
+//   (+ &relay=<url> avec `relay`, + &key=<clé> avec `relayKey`)
 
-parseLink(location.href); // → { room, secret, relay? } ou null
+parseLink(location.href); // → { room, secret, relay?, relayKey? } ou null
+
+joinRoom({ relay: 'wss://…', ...parseLink(location.href) }); // relayKey compris
 ```
 
-Tout est après `#` : le navigateur n'envoie jamais cette partie au serveur web.
+Tout est après `#` : le navigateur n'envoie jamais cette partie au serveur web. Un lien
+est un passe : il porte le secret de la room, et la clé du relay quand on l'y met.
 
 ## Options de `joinRoom()`
 
@@ -89,12 +93,20 @@ Tout est après `#` : le navigateur n'envoie jamais cette partie au serveur web.
 | `room` | **obligatoire** | nom choisi par l'app, 1 à 64 caractères |
 | `secret` | **obligatoire** | sortie de `newSecret()` : 32 octets en base64url (43 caractères). Sans secret valide, la room se ferme avec le code `secret` |
 | `max` | `8` | peers max dans la room, soi compris (2 au minimum). Fixé par celui qui **crée** la room ; ignoré pour les autres ; plafonné par le relay |
-| `relayKey` | — | clé d'accès, si le relay est privé |
-| `iceServers` | `[{ urls: 'stun:stun.l.google.com:19302' }]` | `[]` pour n'utiliser aucun serveur STUN |
+| `relayKey` | — | clé d'accès, si le relay est privé (une clé par application, voir « Lancer un relay ») |
+| `iceServers` | `[{ urls: 'stun:stun.l.google.com:19302' }]` | `[]` pour n'utiliser aucun serveur STUN (navigateur et Node) |
 | `fallback` | `true` | si le direct échoue, passer les messages par le relay (plus lent, toujours chiffré) |
 | `connectMs` | `20000` | délai pour établir le direct avec un peer, avant repli ou abandon |
 | `handshakeMs` | `10000` | délai pour que la preuve du secret aboutisse |
 | `maxMessageBytes` | `1048576` | taille max d'un message envoyé ou reçu (1 Mio) |
+| `sendRate` / `sendBurst` | `100` / `200` | messages par seconde (soutenu / d'un coup) vers le relay, signalisation et repli compris. Un seau par `joinRoom()`, c'est-à-dire par connexion au relay : deux rooms ouvertes sur un appareil = deux seaux. Plafonné à 5/6 de ce que le relay accorde (voir plus bas) |
+
+Le relay coupe une connexion qui dépasse son débit (messages jetés en silence, puis 4429 et une
+faute vers un ban d'IP). Le client reste donc **sous** ce que le relay lui accorde : le `welcome`
+du relay annonce le débit accordé à la connexion, et le client se tient à 5/6 de ce débit, quelle
+que soit l'option demandée. Un relay plus ancien qui ne l'annonce pas : l'option s'applique telle
+quelle, et c'est à l'app de rester sous le `RELAY_RATE` / `RELAY_BURST` du relay (120 / 240 par
+défaut).
 
 ## Room
 
@@ -127,7 +139,7 @@ clé refusée, ban, room pleine à l'entrée).
 |---|---|
 | `peer.id` | son id dans la room |
 | `peer.via` | `'direct'` ou `'relay'` (repli) |
-| `peer.send(data)` | `Promise<void>`, voir ci-dessous |
+| `peer.send(data, options?)` | `Promise`, voir ci-dessous |
 | `peer.on('message', fn)` | `fn(data)` : `string` si on a envoyé une chaîne, sinon `Uint8Array` |
 | `peer.on('close', fn)` | `fn(reason)` |
 | `peer.close()` | coupe ce peer seulement |
@@ -144,6 +156,29 @@ qu'un message. La promesse :
 
 Pas de JSON imposé : `peer.send(JSON.stringify(obj))` et `JSON.parse(data)` côté
 app.
+
+### Envoi non fiable : `peer.send(data, { reliable: false })`
+
+Pour ce qui se périme vite (positions d'un jeu, curseurs) : un message perdu n'est pas renvoyé et
+ne retarde pas les suivants.
+
+- En direct, il part sur un second canal WebRTC, **sans ordre et sans renvoi**. Il peut arriver
+  dans le désordre, ou pas du tout. Il arrive par le même `peer.on('message')`.
+- **Un message = une trame** : au plus 16 384 octets (et pas plus que `maxMessageBytes`), sinon
+  `too-big`. Viser ~1 Ko pour qu'il tienne dans un paquet réseau.
+- **N'attend jamais** : la promesse se résout `true` si le message est parti, `false` s'il a été
+  jeté parce que plus de 64 Ko attendent déjà sur ce canal. Rejetée avec `closed` / `too-big`
+  comme l'autre.
+- **Par le relay** (`peer.via === 'relay'`), il prend le chemin fiable (ordonné, renvoyé) et se
+  résout `true` une fois accepté ; même règle de taille, pour que l'app ne change pas de
+  comportement selon le chemin.
+- Le plafond de réception par peer compte les deux canaux ensemble.
+- Côté Node (werift 0.25), un message **envoyé** depuis Node sur ce canal est sans ordre mais
+  **renvoyé** s'il se perd (il arrive en retard au lieu de jamais) : werift ignore
+  `maxRetransmits: 0`. Un navigateur qui envoie le jette bien.
+
+Sans option (ou `reliable: true`), `send()` reste fiable et ordonné, et sa promesse se résout sans
+valeur.
 
 ## Erreurs
 
@@ -192,8 +227,10 @@ Deux précisions issues de l'implémentation :
    se placer au milieu. Un peer n'émet `peer` qu'après cette preuve.
 4. **Rien n'est lu avant la preuve.** Avant la preuve, un message de plus de
    1 Ko, ou qui n'est pas la preuve, coupe le peer **sans être parsé ni
-   déchiffré**. Un peer légitime n'envoie de données qu'après le « ok » de l'autre :
-   le lag rallonge l'attente, il ne coupe jamais un peer honnête.
+   déchiffré**. Ce qui arrive sur le canal non fiable avant la preuve est jeté sans
+   être lu ; tout autre canal ouvert par un peer est fermé. Un peer légitime n'envoie
+   de données qu'après le « ok » de l'autre : le lag rallonge l'attente, il ne coupe
+   jamais un peer honnête.
 5. **On ne paie rien pour un inconnu.** Aucune connexion WebRTC n'est créée sans
    une offre chiffrée avec le secret ; 4 poignées de main en cours au plus ; une
    offre en double est jetée.
@@ -216,12 +253,13 @@ dépôt) ou avec `TLS_CERT` / `TLS_KEY`.
 | Variable | Défaut | |
 |---|---|---|
 | `PORT` / `HOST` | `8787` / `0.0.0.0` | |
-| `RELAY_KEY` | vide | clé d'accès ; vide = relay ouvert à tous |
+| `RELAY_KEYS` | vide | les clés d'accès, une par application : `nom:clé[:débit[:rafale]]`, séparées par des virgules (voir plus bas) |
+| `RELAY_KEY` | vide | une seule clé (liste d'une clé nommée `default`) ; vide avec `RELAY_KEYS` vide = relay ouvert à tous |
 | `RELAY_ROOM_MAX` | `8` | plafond du `max` d'une room |
 | `RELAY_MAX_BYTES` | `16384` | taille max d'un message ; au-delà, coupé (1009) |
 | `RELAY_HELLO_MS` | `5000` | délai pour recevoir le `hello` |
 | `RELAY_IDLE_MS` | `30000` | silence max après le `hello` |
-| `RELAY_RATE` / `RELAY_BURST` | `120` / `240` | messages par seconde par connexion |
+| `RELAY_RATE` / `RELAY_BURST` | `120` / `240` | messages par seconde par connexion : avant le `hello`, sur un relay ouvert, pour l'ancien protocole, et pour une clé sans débit à elle |
 | `RELAY_OFFERS_PER_MIN` | `6` | offres max d'un peer vers un même peer |
 | `RELAY_IP_CONN` | `10` | connexions simultanées par IP |
 | `RELAY_PENDING_MAX` | `200` | connexions sans `hello`, au total |
@@ -235,13 +273,35 @@ dépôt) ou avec `TLS_CERT` / `TLS_KEY`.
 
 `GET /healthz` répond `200 ok`.
 
+### Clés d'accès
+
+```
+RELAY_KEYS=debrid-remote:<clé>:120:240,signal-test-page:<clé>:30:60,mmo:<clé>:400:800
+```
+
+- **Une clé par application**, chacune avec son débit **par connexion** : chaque connexion qui
+  présente la clé a son propre seau de `débit` / `rafale` (par défaut `RELAY_RATE` / `RELAY_BURST`).
+  Avant son `hello`, une connexion a le seau par défaut ; la clé reconnue, elle passe au sien, plein.
+- La clé est vérifiée au `hello` seulement : une connexion ouverte garde sa clé jusqu'à sa
+  reconnexion. Changer ou retirer une clé = modifier la variable et redémarrer le relay ; les rooms
+  se reconnectent seules, les liens directs ne sont pas touchés.
+- Le journal nomme la clé (`key=debrid-remote`), jamais sa valeur. Une liste mal formée, deux
+  noms ou deux clés identiques : le relay refuse de démarrer, sans afficher de clé.
+- `RELAY_KEY` seule = une liste d'une clé, `default`, au débit par défaut. `RELAY_KEY` **et**
+  `RELAY_KEYS` : le relay refuse de démarrer. Ni l'une ni l'autre : relay ouvert.
+- Un `hello` v1 sans clé, ou avec une clé inconnue, sur un relay à clés : 4401.
+- Avec `RELAY_LEGACY=1`, un `hello` de l'ancien protocole (sans `v`) entre **sans clé**, au débit
+  par défaut, jusqu'à ce que ses clients migrent.
+- Une clé ne protège que la bande passante du relay : les données restent chiffrées de bout en
+  bout par le secret de la room. Une clé dans une page publique est publique.
+
 ## Protocole du relay (pour déboguer)
 
 L'app n'a pas à l'implémenter : `joinRoom()` le parle. JSON texte, version 1.
 
 | Message | Envoyé par | Le relay |
 |---|---|---|
-| `{type:'hello', v:1, id, room, max?, key?}` | chaque peer, en premier | entre dans `room` ; répond `{type:'welcome', peers:[{id}], max, creator}` (`peers` soi compris, `creator` booléen : `true` pour celui qui a créé la room) ; envoie `{type:'peers', list:[{id}]}` à la room |
+| `{type:'hello', v:1, id, room, max?, key?}` | chaque peer, en premier | entre dans `room` ; répond `{type:'welcome', peers:[{id}], max, creator, rate, burst}` (`peers` soi compris, `creator` booléen : `true` pour celui qui a créé la room, `rate` / `burst` : le débit accordé à cette connexion) ; envoie `{type:'peers', list:[{id}]}` à la room |
 | `{type:'signal', to, kind, box}` | un peer | `kind` en clair : `'offer'`, `'answer'` ou `'ice'` ; transmet `{type:'signal', from, kind, box}` à `to` dans la même room. Le relay compte les `offer` (`RELAY_OFFERS_PER_MIN`) ; le client rejette une boîte dont le contenu ne correspond pas à `kind` |
 | `{type:'data', to?, box}` | un peer (repli) | transmet `{type:'data', from, box}` à `to`, ou à toute la room |
 | `{type:'block', id}` | un peer | ne lui transmet plus rien de `id` |
@@ -276,3 +336,10 @@ un HTTP 429 avant même le WebSocket.
 - 2026-10-23 — client : `relay` est fatal sur les fermetures 4400 et 1009 (incompatibilité
   de protocole) ; `banned` n'est observable que côté Node, à l'entrée. Rien ne change pour
   l'app.
+- 2026-10-27 — relay : `RELAY_KEYS`, une clé par application avec son débit par connexion
+  (`RELAY_KEY` seule reste une liste d'une clé) ; l'ancien protocole entre sans clé ; le
+  `welcome` v1 porte `rate` / `burst`. Client : options `sendRate` / `sendBurst` (défauts
+  inchangés, plafonnés à 5/6 de ce qu'accorde le relay) ; `peer.send(data, { reliable: false })`
+  sur un canal sans ordre ni renvoi (une trame, jamais d'attente, chemin fiable par le relay) ;
+  `formatLink` / `parseLink` portent `relayKey` (`&key=`) ; `iceServers: []` n'interroge plus
+  aucun serveur STUN côté Node. Rien ne change pour une app qui n'utilise pas ces nouveautés.

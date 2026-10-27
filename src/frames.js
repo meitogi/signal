@@ -2,8 +2,9 @@
 // frames of at most CHUNK + 1 bytes out, whole again on the other side.
 //
 // Frame : `flags (1) | payload`. flags bit 0 = text (UTF-8), bit 1 = last frame of the message.
-// Channels are ordered and reliable, so frames need no sequence number — only one message is in
-// flight per channel at a time (the sender serialises).
+// The reliable channel is ordered, so frames need no sequence number — only one message is in flight
+// per channel at a time (the sender serialises). The unreliable channel carries whole messages only :
+// one frame each, the last-frame bit set (isWhole).
 const TEXT = 1;
 const LAST = 2;
 const utf8 = new TextEncoder();
@@ -11,6 +12,9 @@ const decoder = new TextDecoder();
 
 /** Payload bytes per frame : 16 KB, the long-standing interoperable DataChannel message size. */
 export const CHUNK = 16 * 1024;
+
+/** True for a frame that is a whole message on its own. */
+export const isWhole = (frame) => frame.length >= 1 && (frame[0] & LAST) !== 0;
 
 /**
  * @param {unknown} data - what the app passed to send()

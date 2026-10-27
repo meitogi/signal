@@ -8,8 +8,11 @@
 // at the HTTP `upgrade` (429 before any WebSocket), `maxPayload` during reception, the hello
 // deadline, a per-socket token bucket, an offer cap per sender→target, an idle deadline.
 //
+// Access : open, or a list of keys (one per application), each with its own rate. A socket starts
+// with the default bucket ; its hello's key switches it to that key's rate, and `welcome` says which.
+//
 // `RELAY_LEGACY=1` also accepts the old open protocol (hello without `v` / `room`) in room "",
-// with `name` / `kind` in the peer lists, as the pre-v1 relay did.
+// with `name` / `kind` in the peer lists, as the pre-v1 relay did ; such a hello needs no key.
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { createServer as createHttpServer } from 'node:http';
 import { createServer as createHttpsServer } from 'node:https';
@@ -19,7 +22,7 @@ import { createGuard, parseTrust } from './ip-guard.js';
 /** Close codes sent to a client, in the 4000–4999 application range (1009 is sent by `ws`). */
 export const CLOSE = {
   badHello: 4400, // malformed hello
-  key: 4401, // missing / wrong RELAY_KEY, a first message that is not a hello, or no hello in time
+  key: 4401, // missing / wrong relay key, a first message that is not a hello, or no hello in time
   roomFull: 4403,
   idle: 4408, // silent for idleMs after the hello
   idTaken: 4409,
@@ -37,7 +40,42 @@ const LEGACY_ROOM = '';
 // instead of holding its slot through `ws`'s 30 s closing handshake.
 const CLOSE_GRACE_MS = 1000;
 
+const KEY_NAME = /^[A-Za-z0-9_.-]{1,64}$/;
+
 const digest = (text) => createHash('sha256').update(text).digest();
+
+/**
+ * Reads `RELAY_KEYS` : `name:key[:rate[:burst]]` entries, comma-separated. Throws on anything else,
+ * naming the entry by position (and name when valid) — never quoting a key.
+ * @param {string} text
+ * @returns {{name: string, key: string, rate?: number, burst?: number}[]}
+ */
+export function parseKeys(text) {
+  const list = [];
+  const names = Object.create(null);
+  const digests = Object.create(null);
+  const entries = String(text).split(',');
+  for (let i = 0; i < entries.length; i++) {
+    const fields = entries[i].trim().split(':');
+    const at = `RELAY_KEYS entry ${i + 1}`;
+    const name = fields[0];
+    if (fields.length < 2 || fields.length > 4) throw new Error(`${at} : expected name:key[:rate[:burst]]`);
+    if (!KEY_NAME.test(name)) throw new Error(`${at} : the name must be 1 to 64 characters among A-Z a-z 0-9 _ . -`);
+    const key = fields[1];
+    if (key.length === 0 || /\s/.test(key)) throw new Error(`${at} (${name}) : empty key, or a key with spaces`);
+    const [rate, burst] = [fields[2], fields[3]].map((v) => (v === undefined ? undefined : Number(v)));
+    for (const n of [rate, burst]) {
+      if (n !== undefined && !(Number.isInteger(n) && n > 0)) throw new Error(`${at} (${name}) : rate and burst must be positive integers`);
+    }
+    if (names[name]) throw new Error(`${at} (${name}) : this name is already used`);
+    const d = digest(key).toString('hex');
+    if (digests[d]) throw new Error(`${at} (${name}) : same key as ${digests[d]}`);
+    names[name] = true;
+    digests[d] = name;
+    list.push({ name, key, rate, burst });
+  }
+  return list;
+}
 
 function validField(value, required) {
   if (value === undefined && !required) return true;
@@ -49,14 +87,17 @@ function validField(value, required) {
  * @param {object} [options]
  * @param {number} [options.port=8787] - 0 picks a free port (tests)
  * @param {string} [options.host='0.0.0.0']
- * @param {string} [options.key=''] - RELAY_KEY ; empty = open relay
+ * @param {string} [options.key=''] - RELAY_KEY : a list of one key named `default`, at `rate` / `burst`
+ * @param {{name: string, key: string, rate?: number, burst?: number}[]} [options.keys] - RELAY_KEYS (parseKeys) ;
+ *   an entry without rate / burst gets `rate` / `burst`. Neither `key` nor `keys` = open relay ; both = refused
  * @param {{cert: string|Buffer, key: string|Buffer}} [options.tls] - serve wss:// itself
  * @param {number} [options.roomMax=8] - ceiling of a room's `max`
  * @param {number} [options.maxBytes=16384] - largest WebSocket message accepted (1009 above)
  * @param {number} [options.helloMs=5000] - a socket without a valid hello by then is closed 4401
  * @param {number} [options.idleMs=30000] - a v1 socket silent this long after its hello is closed 4408
- * @param {number} [options.rate=120] - messages per second per socket, sustained
- * @param {number} [options.burst=240] - messages a socket may send at once
+ * @param {number} [options.rate=120] - messages per second per socket, sustained : before the hello, on an open
+ *   relay, for legacy hellos, and for a key without its own
+ * @param {number} [options.burst=240] - messages a socket may send at once (same cases)
  * @param {number} [options.offersPerMin=6] - offers from one peer to the same peer per minute
  * @param {number} [options.ipConn=10] - concurrent sockets per IP
  * @param {number} [options.pendingMax=200] - sockets without a hello, all IPs
@@ -75,6 +116,7 @@ export function createRelay({
   port = 8787,
   host = '0.0.0.0',
   key = '',
+  keys,
   tls,
   roomMax = 8,
   maxBytes = 16384,
@@ -94,7 +136,11 @@ export function createRelay({
   logData = false,
   log = console.log,
 } = {}) {
-  const keyDigest = key ? digest(key) : null;
+  if (key && keys !== undefined) return Promise.reject(new Error('give `key` or `keys`, not both (RELAY_KEY or RELAY_KEYS)'));
+  /** One grant per key : who gets in, at which rate. Empty = open relay. */
+  const grants = (keys ?? (key ? [{ name: 'default', key }] : [])).map((k) => ({
+    name: k.name, digest: digest(k.key), rate: k.rate ?? rate, burst: k.burst ?? burst,
+  }));
   const guard = createGuard({ ipConn, pendingMax, connMax, banAfter, banMs, trust: parseTrust(trustProxy), log });
   /** room id → {max, size, legacy, peers: peer id → client} */
   const rooms = Object.create(null);
@@ -146,8 +192,13 @@ export function createRelay({
     for (const id in peers) peers[id].send(raw);
   }
 
-  function keyMatches(candidate) {
-    return typeof candidate === 'string' && timingSafeEqual(digest(candidate), keyDigest);
+  /** The grant whose key `candidate` is, or null. Every entry is compared, match or not. */
+  function grantOf(candidate) {
+    if (typeof candidate !== 'string') return null;
+    const d = digest(candidate);
+    let found = null;
+    for (const g of grants) if (timingSafeEqual(d, g.digest)) found = g;
+    return found;
   }
 
   function shut(client, code, reason) {
@@ -160,8 +211,7 @@ export function createRelay({
     client.killTimer = setTimeout(() => ws.terminate(), CLOSE_GRACE_MS);
   }
 
-  function join(client, msg) {
-    const isLegacy = legacy && msg.v === undefined;
+  function join(client, msg, isLegacy, grant) {
     const id = msg.id;
     const roomId = isLegacy ? LEGACY_ROOM : msg.room;
     const max = msg.max;
@@ -191,15 +241,20 @@ export function createRelay({
     client.roomId = roomId;
     clearTimeout(client.helloTimer);
     guard.helloed(client.slot);
+    if (grant !== null) {
+      client.rate = grant.rate;
+      client.burst = grant.burst;
+      client.tokens = grant.burst;
+    }
     if (isLegacy) {
       client.name = msg.name || id.slice(0, 6);
       client.kind = msg.kind || 'client';
       client.send(JSON.stringify({ type: 'welcome', peers: peerList(room) }));
     } else {
       client.idleTimer = setTimeout(() => shut(client, CLOSE.idle, 'idle'), idleMs);
-      client.send(JSON.stringify({ type: 'welcome', peers: peerList(room), max: room.max, creator }));
+      client.send(JSON.stringify({ type: 'welcome', peers: peerList(room), max: room.max, creator, rate: client.rate, burst: client.burst }));
     }
-    log(`  hello ${id.slice(0, 6)} room=${isLegacy ? 'legacy' : roomId.slice(0, 8)}${creator ? ' (creator)' : ''} ${room.size}/${room.max}`);
+    log(`  hello ${id.slice(0, 6)} room=${isLegacy ? 'legacy' : roomId.slice(0, 8)}${creator ? ' (creator)' : ''} ${room.size}/${room.max}${grant !== null ? ` key=${grant.name}` : ''}`);
     broadcastPeers(room);
   }
 
@@ -283,6 +338,8 @@ export function createRelay({
       name: null,
       kind: null,
       alive: true,
+      rate,
+      burst,
       tokens: burst,
       stamp: Date.now(),
       drops: 0,
@@ -303,10 +360,10 @@ export function createRelay({
     ws.on('message', (raw, isBinary) => {
       if (ws.readyState !== ws.OPEN) return; // closing : what follows our close is not read (nor counted twice)
       const now = Date.now();
-      client.tokens = Math.min(burst, client.tokens + ((now - client.stamp) * rate) / 1000);
+      client.tokens = Math.min(client.burst, client.tokens + ((now - client.stamp) * client.rate) / 1000);
       client.stamp = now;
       if (client.tokens < 1) {
-        if (++client.drops >= burst) shut(client, CLOSE.rate, 'rate limit');
+        if (++client.drops >= client.burst) shut(client, CLOSE.rate, 'rate limit');
         return;
       }
       client.tokens--;
@@ -320,8 +377,13 @@ export function createRelay({
       const valid = msg !== null && typeof msg === 'object';
       if (client.id === null) {
         if (!valid || msg.type !== 'hello') return shut(client, CLOSE.key, 'hello first');
-        if (keyDigest && !keyMatches(msg.key)) return shut(client, CLOSE.key, 'key');
-        return join(client, msg);
+        const isLegacy = legacy && msg.v === undefined;
+        let grant = null;
+        if (!isLegacy && grants.length > 0) {
+          grant = grantOf(msg.key);
+          if (grant === null) return shut(client, CLOSE.key, 'key');
+        }
+        return join(client, msg, isLegacy, grant);
       }
       if (!valid) return;
       if (msg.type === 'ping') client.send(JSON.stringify({ type: 'pong', ts: msg.ts, srv: now }));
@@ -352,7 +414,9 @@ export function createRelay({
     server.once('error', reject);
     server.listen(port, host, () => {
       const actual = server.address().port;
-      log(`@meitogi/signal relay listening ${tls ? 'wss' : 'ws'}://${host}:${actual} ${keyDigest ? 'private (RELAY_KEY set)' : 'OPEN (no RELAY_KEY)'}${legacy ? ' + legacy protocol' : ''}`);
+      const n = grants.length;
+      const access = n > 0 ? `private, ${n} key${n > 1 ? 's' : ''} (${grants.map((g) => g.name).join(', ')})` : 'OPEN (no RELAY_KEY)';
+      log(`@meitogi/signal relay listening ${tls ? 'wss' : 'ws'}://${host}:${actual} ${access}${legacy ? ' + legacy protocol' : ''}`);
       resolve({
         port: actual,
         setTls(next) {

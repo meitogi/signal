@@ -16,10 +16,17 @@
 //   RELAY       wss://… (default wss://signal.du.ranchchoco.boo), or `local` : a relay in this process (RELAY_PORT)
 //   LOCAL_PAGE  <port> : serve ../signal-test-page/index.html from here, its library import pointed at this tree
 //   PAGE_URL    the published page (default https://meitogi.github.io/signal-test-page/)
-//   PEER=node   a node responder in this process instead of a browser (loopback runs)
-//   ICE=none    `iceServers: []` (loopback ; werift still asks its built-in STUN server) ; EXPECT_DIRECT=1 : no direct path fails the run
+//   PEER=node   a node responder in this process instead of a browser (loopback runs) ; it enters through
+//               parseLink() of the printed link, like the page
+//   ICE=none    `iceServers: []` (loopback, no STUN request) ; EXPECT_DIRECT=1 : no direct path fails the run
+//   RELAY_KEY   the relay key : both sides' joinRoom, carried to the peer in the link fragment (`&key=`) ;
+//               a wrong key is checked to be refused (`key`)
+//   RELAY_KEYS  with RELAY=local : the local relay's key list (name:key[:rate[:burst]], as the relay's env)
+//   SEND_RATE / SEND_BURST  joinRoom's sendRate / sendBurst on both sides (library defaults when unset) ;
+//               the legs are sized against them, clamped to 5/6 of the relay's grant as the client does
 //   WAIT_MS (180000) for the second peer ; BIG_BYTES (1000000) ; FLOW_BYTES (4000000) relay throughput
-//   CADENCE=0 ; RATES (30,60,120) ; LEG_MS (10000) per leg ; LATE_MS (100) ; BENCH_JSON=<file> : results as JSON
+//   CADENCE=0 ; RATES (30,60,120) ; LEG_MS (10000) per leg ; LATE_MS (100) ; UNRELIABLE=0 skips the
+//   unreliable legs ; BENCH_JSON=<file> : results as JSON
 //   Each run is saved in BENCH_DIR (default deploy/test/results/, gitignored : it holds public IPs) as
 //   <date>_<device>_<network>.json + .txt (the whole output), with one row appended to results.md.
 //   The device comes from the peer's user agent (Brave through navigator.brave), the network from
@@ -30,7 +37,9 @@
 //
 // Peer protocol (index.html implements the same) : a text message starting `{"bench"` is a command —
 // `report` → `{"bench":"report", via, lib, ua, local, remote, pair, received, echoed}`, `summary` → lines
-// to show ; any other text comes back as `echo:<text>`, any bytes come back reversed.
+// to show, `mode` `{"bench":"mode","reliable":false}` → bytes are echoed with `send(…, { reliable: false })`
+// until a `mode` with `reliable: true` ; any other text comes back as `echo:<text>`, any bytes come back
+// reversed.
 import { execFileSync } from 'node:child_process';
 import { reverse } from 'node:dns/promises';
 import { appendFileSync, createReadStream, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -52,8 +61,9 @@ register(`data:text/javascript,${encodeURIComponent(`
 const { built } = await import('./bench-werift.mjs');
 const { platform } = await import('../../src/node-platform.js');
 const { createClient } = await import('../../src/room.js');
-const { formatLink, newSecret } = await import('../../src/node.js');
-const { createRelay } = await import('../../src/relay.js');
+const { formatLink, newSecret, parseLink } = await import('../../src/node.js');
+const { createRelay, parseKeys } = await import('../../src/relay.js');
+const lib = await import('../../src/relay-session.js');
 
 const env = process.env;
 const ROOT = join(HERE, '../..');
@@ -68,8 +78,23 @@ const RATES = (env.RATES || '30,60,120').split(',').map(Number);
 const LEG_MS = Number(env.LEG_MS || 10_000);
 const LATE_MS = Number(env.LATE_MS || 100);
 const EXPECT_DIRECT = env.EXPECT_DIRECT === '1';
+const RELAY_KEY = env.RELAY_KEY || undefined;
+const LOCAL_KEYS = env.RELAY_KEYS ? parseKeys(env.RELAY_KEYS) : undefined;
+const UNRELIABLE = env.UNRELIABLE !== '0';
 // The budgets the cadence legs are sized against (src/relay-session.js, bin/signal.js, src/peer.js, src/room.js).
-const SEND_RATE = 100, SEND_BURST = 200, RELAY_RATE = 120, PEER_RATE = 1000, RELAY_CHUNK = 11 * 1024, CHUNK = 16 * 1024;
+// The client holds itself to 5/6 of what the relay grants : the grant is known for a local relay (its key
+// list), assumed to be the relay defaults (120 / 240) otherwise.
+const ASKED_RATE = Number(env.SEND_RATE || lib.SEND_RATE);
+const ASKED_BURST = Number(env.SEND_BURST || lib.SEND_BURST);
+const grantOf = () => {
+  const entry = LOCAL_KEYS?.find((k) => k.key === RELAY_KEY);
+  return { rate: entry?.rate ?? 120, burst: entry?.burst ?? 240 };
+};
+const GRANT = grantOf();
+const SEND_RATE = Math.min(ASKED_RATE, Math.floor((GRANT.rate * 5) / 6));
+const SEND_BURST = Math.min(ASKED_BURST, Math.floor((GRANT.burst * 5) / 6));
+const SEND_OPTIONS = { sendRate: ASKED_RATE, sendBurst: ASKED_BURST };
+const RELAY_RATE = GRANT.rate, PEER_RATE = 1000, RELAY_CHUNK = 11 * 1024, CHUNK = 16 * 1024;
 const TICK_MS = 20;
 const PACKET = 16;
 const ROOM = 'bench';
@@ -244,7 +269,7 @@ function save() {
   if (!existsSync(index)) {
     appendFileSync(index, '| date (UTC) | device | network | direct | pair (node side) | relay MB/s | relay 60 Hz p50 / p95 | direct 60 Hz p50 / p95 | result |\n|---|---|---|---|---|---|---|---|---|\n');
   }
-  const leg = (path) => results.cadence.find((l) => l.path === path && l.rate === 60 && !l.batch);
+  const leg = (path) => results.cadence.find((l) => l.path === path && l.reliable && l.rate === 60 && !l.batch);
   const rtt = (l) => (l ? `${l.p50.toFixed(1)} / ${l.p95.toFixed(1)} ms` : '—');
   const s = results.scenarios;
   const cells = [
@@ -258,11 +283,14 @@ function save() {
 
 // ── the responder (PEER=node) : the page's bench mode, in node ───────────────────────────────────
 
-async function responder(parts) {
+async function responder(link) {
+  const parts = { ...parseLink(link), relay: relayUrl }; // the page's relay URL names localhost ; same relay
+  check(parts.relayKey === RELAY_KEY, `the responder read the relay key from the link fragment : ${parts.relayKey ? 'present' : 'none'}${RELAY_KEY ? '' : ' (no RELAY_KEY)'}`);
   const serve = (peer, pcs, state) => peer.on('message', async (data) => {
     if (typeof data === 'string' && data.startsWith('{"bench"')) {
       const msg = JSON.parse(data);
       if (msg.bench === 'report') await peer.send(JSON.stringify({ bench: 'report', via: peer.via, lib: 'node:local', ua: `node ${process.version}`, received: state.received, echoed: state.echoed, ...(await facts(pcs)) }));
+      else if (msg.bench === 'mode') state.reliable = msg.reliable !== false;
       return;
     }
     if (typeof data === 'string') {
@@ -271,12 +299,12 @@ async function responder(parts) {
     }
     if (data.length <= 64) state.received.push(`bytes:${data.join(',')}`);
     state.echoed++;
-    peer.send(reversed(data)).catch(() => {});
+    peer.send(reversed(data), state.reliable ? undefined : { reliable: false }).catch(() => {});
   });
   const enter = async (room, options) => {
     const { pcs, joinRoom } = recorded();
-    const r = joinRoom({ ...parts, room, iceServers: ICE, ...options });
-    const state = { received: [], echoed: 0 };
+    const r = joinRoom({ ...parts, room, iceServers: ICE, ...SEND_OPTIONS, ...options });
+    const state = { received: [], echoed: 0, reliable: true };
     r.on('peer', (peer) => serve(peer, pcs, state));
     await new Promise((resolve) => { r.on('peer', resolve); setTimeout(resolve, 40_000); });
     return r;
@@ -291,26 +319,31 @@ const median = (list) => pct([...list].sort((a, b) => a - b), 50);
 const ms = (v) => (Number.isFinite(v) ? `${v.toFixed(1)} ms` : '—');
 
 /** What the leg sends per second from each side, and what that means against the budgets. */
-function sizing(path, rate, batch) {
+function sizing(path, rate, batch, reliable) {
   const sends = batch ? Math.min(rate, 1000 / TICK_MS) : rate;
-  if (path === 'direct') return { sends, line: `${sends}/s per side, direct : vs ${PEER_RATE} frames/s receive cap — fits`, queueS: 0 };
+  if (path === 'direct') return { sends, line: `${sends}/s per side, direct${reliable ? '' : ' unreliable (never waits : dropped above 64 KB buffered)'} : vs ${PEER_RATE} frames/s receive cap — fits`, queueS: 0 };
   // The bucket starts full (SEND_BURST) ; above SEND_RATE it drains by (sends - SEND_RATE)/s, then the queue grows.
   const backlog = Math.max(0, (sends - SEND_RATE) * (LEG_MS / 1000) - SEND_BURST);
   const queueS = backlog / SEND_RATE;
   const verdict = sends <= SEND_RATE ? 'fits' : `over the bucket by ${sends - SEND_RATE}/s : burst lasts ${(SEND_BURST / (sends - SEND_RATE)).toFixed(1)} s, predicted queue at the end ${queueS.toFixed(1)} s (waits, never dropped)`;
-  return { sends, queueS, line: `${sends}/s per side, relay : vs bucket ${SEND_RATE}/s burst ${SEND_BURST} per room, relay ${RELAY_RATE}/s per socket — ${verdict}` };
+  return { sends, queueS, line: `${sends}/s per side, relay : vs bucket ${SEND_RATE}/s burst ${SEND_BURST} per room (asked ${ASKED_RATE} / ${ASKED_BURST}), relay grant ${RELAY_RATE}/s per socket — ${verdict}` };
 }
 
 let legId = 0;
-async function cadenceLeg(link, path, rate, batch) {
+async function cadenceLeg(link, path, rate, batch, reliable = true) {
   const id = ++legId;
   const total = Math.round((rate * LEG_MS) / 1000);
   const sentAt = new Array(total);
   const rtt = new Array(total);
   let echoed = 0;
   let sends = 0;
-  const size = sizing(path, rate, batch);
-  say(`leg ${path} ${rate} Hz ${batch ? `batched ${TICK_MS} ms` : 'unbatched'} — ${size.line}`);
+  let dropped = 0;
+  const size = sizing(path, rate, batch, reliable);
+  say(`leg ${path}${reliable ? '' : ' unreliable'} ${rate} Hz ${batch ? `batched ${TICK_MS} ms` : 'unbatched'} — ${size.line}`);
+  if (!reliable) {
+    await link.peer.send('{"bench":"mode","reliable":false}');
+    await sleep(300); // the mode (reliable channel) is in before the first packet (unreliable channel)
+  }
   link.box.bytes = (data) => {
     const now = performance.now();
     const back = reversed(data);
@@ -321,7 +354,11 @@ async function cadenceLeg(link, path, rate, batch) {
       if (seq < total && rtt[seq] === undefined) { rtt[seq] = now - sentAt[seq]; echoed++; }
     }
   };
-  const send = (bytes) => { sends++; link.peer.send(bytes).catch(() => {}); };
+  const send = (bytes) => {
+    sends++;
+    if (reliable) return void link.peer.send(bytes).catch(() => {});
+    link.peer.send(bytes, { reliable: false }).then((ok) => { if (!ok) dropped++; }, () => {});
+  };
   const packet = (seq) => {
     const b = new Uint8Array(PACKET);
     const view = new DataView(b.buffer);
@@ -356,6 +393,7 @@ async function cadenceLeg(link, path, rate, batch) {
   const drainUntil = performance.now() + size.queueS * 2000 + 5000;
   while (echoed < total && performance.now() < drainUntil) await sleep(50);
   link.box.bytes = null;
+  if (!reliable) await link.peer.send('{"bench":"mode","reliable":true}');
 
   const got = rtt.filter((v) => v !== undefined);
   const sorted = [...got].sort((a, b) => a - b);
@@ -366,14 +404,14 @@ async function cadenceLeg(link, path, rate, batch) {
   const firstS = rtt.slice(0, rate).filter((v) => v !== undefined);
   const lastS = rtt.slice(-rate).filter((v) => v !== undefined);
   const leg = {
-    path, rate, batch, packets: total, sends, sendsPerS: +(sends / (sendMs / 1000)).toFixed(1), expectedSendsPerS: size.sends,
+    path, reliable, rate, batch, packets: total, sends, dropped, sendsPerS: +(sends / (sendMs / 1000)).toFixed(1), expectedSendsPerS: size.sends,
     predictedQueueS: +size.queueS.toFixed(2), echoed, missing: total - echoed, late, lost: total - echoed + late,
     lossPct: +(((total - echoed + late) / total) * 100).toFixed(1),
     p50: pct(sorted, 50), p95: pct(sorted, 95), p99: pct(sorted, 99), max: sorted.at(-1) ?? NaN,
     jitter: pairs ? jitter / pairs : NaN, firstSecondMedian: median(firstS), lastSecondMedian: median(lastS),
   };
   results.cadence.push(leg);
-  info(`  sent ${total} packets in ${sends} sends (${leg.sendsPerS}/s) ; echoed ${echoed} ; lost ${leg.lost} (${leg.lossPct} %) = ${leg.missing} never back + ${late} over ${LATE_MS} ms`);
+  info(`  sent ${total} packets in ${sends} sends (${leg.sendsPerS}/s)${reliable ? '' : `, ${dropped} sends dropped here (backed up)`} ; echoed ${echoed} ; lost ${leg.lost} (${leg.lossPct} %) = ${leg.missing} never back + ${late} over ${LATE_MS} ms`);
   info(`  RTT p50 ${ms(leg.p50)} p95 ${ms(leg.p95)} p99 ${ms(leg.p99)} max ${ms(leg.max)} ; jitter ${ms(leg.jitter)} ; median first second ${ms(leg.firstSecondMedian)} → last second ${ms(leg.lastSecondMedian)}`);
   return leg;
 }
@@ -384,7 +422,7 @@ let relay = null;
 let relayUrl = env.RELAY || 'wss://signal.du.ranchchoco.boo';
 let pageRelay = relayUrl;
 if (relayUrl === 'local') {
-  relay = await createRelay({ port: Number(env.RELAY_PORT || 0), host: '0.0.0.0', log: () => {} });
+  relay = await createRelay({ port: Number(env.RELAY_PORT || 0), host: '0.0.0.0', keys: LOCAL_KEYS, log: () => {} });
   relayUrl = `ws://127.0.0.1:${relay.port}`;
   pageRelay = `ws://localhost:${relay.port}`;
 }
@@ -412,16 +450,24 @@ let code = 1;
 try {
   for (const [key, name] of [['direct', ROOM], ['relay', RELAY_ROOM]]) {
     const { pcs, joinRoom } = recorded();
-    const room = joinRoom({ relay: relayUrl, room: name, secret, iceServers: ICE });
+    const room = joinRoom({ relay: relayUrl, room: name, secret, iceServers: ICE, relayKey: RELAY_KEY, ...SEND_OPTIONS });
     room.on('error', (e) => info(`room ${name} : ${e.code} ${e.message}`));
     const first = new Promise((resolve) => room.on('peer', resolve));
     await room.ready;
     rooms[key] = { room, pcs, first };
   }
-  const link = `${formatLink(PAGE, { room: ROOM, secret, relay: pageRelay })}&mode=bench`;
-  say(`relay ${relayUrl} ; node ${process.version} ${process.platform} ; iceServers ${ICE ? '[] (werift keeps its own STUN default)' : 'library default (STUN)'}`);
+  const link = `${formatLink(PAGE, { room: ROOM, secret, relay: pageRelay, relayKey: RELAY_KEY })}&mode=bench`;
+  say(`relay ${relayUrl}${RELAY_KEY ? ' with a relay key (in the link)' : ''} ; node ${process.version} ${process.platform} ; iceServers ${ICE ? '[] (no STUN)' : 'library default (STUN)'} ; sendRate ${ASKED_RATE} / sendBurst ${ASKED_BURST}`);
+  if (RELAY_KEY) {
+    // 0. the key gate : the rooms above got in with the key ; the same relay refuses a wrong one.
+    check(true, 'relay key : both rooms entered with RELAY_KEY');
+    const wrong = createClient(platform).joinRoom({ relay: relayUrl, room: 'bench-wrong-key', secret, iceServers: ICE, relayKey: `${RELAY_KEY}-wrong` });
+    const refused = await wrong.ready.then(() => 'entered', (e) => e.code);
+    wrong.leave();
+    check(refused === 'key', `relay key : a wrong key is refused (${refused})`);
+  }
   if (PEER === 'node') {
-    others = await responder({ relay: relayUrl, secret });
+    others = await responder(link);
   } else {
     say(`open this link in the browser (the phone : 4G with Wi-Fi off, or the same Wi-Fi), within ${WAIT_MS / 1000} s :`);
     console.log(`\n    ${link}\n`);
@@ -512,19 +558,23 @@ try {
   // game cadence
   if (env.CADENCE !== '0') {
     say(`— game cadence : node sends fixed-rate ${PACKET}-byte packets, the peer echoes each message ; latency = RTT from the echo (no clock offset needed)`);
-    say(`  loss = never echoed, or echoed after ${LATE_MS} ms (the channel is reliable and ordered : a lost packet shows up late) ; jitter = mean |RTT(n) - RTT(n-1)|`);
+    say(`  loss = never echoed + echoed after ${LATE_MS} ms, counted apart : on the reliable channel a lost packet shows up late ; on the unreliable one (direct only) it never comes back — and with a node sender (werift) it is retransmitted, so it shows up late too ; jitter = mean |RTT(n) - RTT(n-1)|`);
     say(`  batched = the packets of each ${TICK_MS} ms tick in one message (its RTT includes the wait for the tick)`);
     const paths = links.direct.peer.via === 'direct' ? ['direct', 'relay'] : ['relay'];
     if (paths.length === 1) info('no direct path : direct legs skipped');
+    if (!UNRELIABLE) info('UNRELIABLE=0 : unreliable legs skipped');
+    else info('unreliable legs on the direct path only : over the relay, reliable: false takes the reliable path');
     for (const path of paths) {
       for (const rate of RATES) {
-        for (const batch of [false, true]) {
-          await cadenceLeg(links[path], path, rate, batch);
-          await sleep(2500); // bucket full again for the next leg
+        for (const reliable of path === 'direct' && UNRELIABLE ? [true, false] : [true]) {
+          for (const batch of [false, true]) {
+            await cadenceLeg(links[path], path, rate, batch, reliable);
+            await sleep(2500); // bucket full again for the next leg
+          }
         }
       }
     }
-    for (const leg of results.cadence) check(leg.echoed > 0 && !links[leg.path].peer.closed, `cadence ${leg.path} ${leg.rate} Hz ${leg.batch ? 'batched' : 'unbatched'} : echoes came back, peer still open`);
+    for (const leg of results.cadence) check(leg.echoed > 0 && !links[leg.path].peer.closed, `cadence ${leg.path}${leg.reliable ? '' : ' unreliable'} ${leg.rate} Hz ${leg.batch ? 'batched' : 'unbatched'} : echoes came back, peer still open`);
   }
 
   // 5. summary
@@ -535,7 +585,7 @@ try {
     `2. relay forced : via ${s.relay.via} / ${s.relay.peerVia} ; ${s.relay.flowBytes} B each way in ${(s.relay.ms / 1000).toFixed(1)} s ≈ ${s.relay.mbPerS} MB/s`,
     `3. echoes : ${Object.entries(s.echo).map(([k, v]) => `${k} (via ${v.via}) ${v.ok ? 'ok' : 'FAIL'}`).join(' ; ')}`,
     `4. large ${BIG} B : ${Object.entries(s.large).map(([k, v]) => `${k} (via ${v.via}) ${v.ok ? `${(v.ms / 1000).toFixed(2)} s` : 'FAIL'}`).join(' ; ')}`,
-    ...results.cadence.map((l) => `cadence ${l.path} ${l.rate} Hz ${l.batch ? 'batched' : 'unbatched'} : ${l.sendsPerS} sends/s, RTT p50 ${ms(l.p50)} p95 ${ms(l.p95)}, jitter ${ms(l.jitter)}, lost ${l.lossPct} %`),
+    ...results.cadence.map((l) => `cadence ${l.path}${l.reliable ? '' : ' unreliable'} ${l.rate} Hz ${l.batch ? 'batched' : 'unbatched'} : ${l.sendsPerS} sends/s, RTT p50 ${ms(l.p50)} p95 ${ms(l.p95)}, jitter ${ms(l.jitter)}, lost ${l.lossPct} % (${l.missing} never back, ${l.late} late${l.reliable ? '' : `, ${l.dropped} dropped here`})`),
     failed ? `FAIL — ${failed} assertion(s)` : 'PASS',
   ];
   console.log(`\n${lines.join('\n')}\n`);

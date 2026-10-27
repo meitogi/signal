@@ -189,3 +189,83 @@ test('a relay-via peer is dropped when it leaves the relay, and re-linked when i
     await relay.close();
   }
 });
+
+/** Seconds between the first and the last of the last `n` relay `data` frames sent. */
+function dataSpan(frames, n) {
+  const stamps = frames.filter((f) => f.dir === 'out' && f.text.startsWith('{"type":"data"')).map((f) => f.at);
+  const last = stamps.slice(-n);
+  assert.equal(last.length, n, `only ${stamps.length} data frames`);
+  return (last.at(-1) - last[0]) / 1000;
+}
+
+/** Two relay peers (no direct path) ; `a` sends `count` messages through the relay, all awaited. */
+async function relayBurst(relay, frames, shared, aOptions, count) {
+  const options = fresh(urlOf(relay), { connectMs: 1, ...shared });
+  const b = joinWith(brokenIce())(options);
+  await b.ready;
+  const a = joinWith(stamped(frames, brokenIce()))({ ...options, ...aOptions });
+  await a.ready;
+  await waitFor(() => a.peers.length === 1 && b.peers.length === 1, 15_000, 'relay peers');
+  let received = 0;
+  b.peers[0].on('message', () => { received++; });
+  await sleep(500); // the join / ok frames are out of the way
+  for (let i = 0; i < count; i++) await a.peers[0].send(`m${i}`);
+  await waitFor(() => received === count, 15_000, `${count} messages through the relay`);
+  return [a, b];
+}
+
+/** `tapped` with a time stamp on each frame. */
+function stamped(frames, base) {
+  const log = { push: (f) => frames.push({ ...f, at: Date.now() }) };
+  return tapped(log, base);
+}
+
+test('sendRate / sendBurst : the relay socket sends at the configured rate, measured on the wire', { timeout: 30_000 }, async () => {
+  const relay = await startRelay();
+  const frames = [];
+  const rooms = await relayBurst(relay, frames, {}, { sendRate: 20, sendBurst: 4 }, 30);
+  try {
+    // Past the burst the bucket spaces frames by 1/20 s : 20 frames span ≈ 19 / 20 = 0.95 s.
+    const span = dataSpan(frames, 20);
+    assert.ok(span >= 0.85 && span <= 1.3, `20 frames in ${span} s at sendRate 20`);
+  } finally {
+    leaveAll(rooms);
+    await relay.close();
+  }
+});
+
+test('sendRate : clamped to 5/6 of the grant the relay announces in its welcome', { timeout: 30_000 }, async () => {
+  const relay = await startRelay({ keys: [{ name: 'small', key: 'small-key', rate: 12, burst: 6 }] });
+  const frames = [];
+  // Asks for 100/s ; the relay grants 12/s, burst 6 → the client holds itself to 10/s, burst 5.
+  const rooms = await relayBurst(relay, frames, { relayKey: 'small-key' }, { sendRate: 100, sendBurst: 200 }, 16);
+  try {
+    const welcome = JSON.parse(frames.find((f) => f.dir === 'in' && f.text.startsWith('{"type":"welcome"')).text);
+    assert.deepEqual([welcome.rate, welcome.burst], [12, 6]);
+    const span = dataSpan(frames, 11);
+    assert.ok(span >= 0.9 && span <= 1.4, `11 frames in ${span} s : 10/s expected`);
+  } finally {
+    leaveAll(rooms);
+    await relay.close();
+  }
+});
+
+test('sendRate holds with a busy event loop : a late timer is not lost rate', { timeout: 30_000 }, async () => {
+  const relay = await startRelay({ rate: 1000, burst: 2000 });
+  const frames = [];
+  // The bench's load : a 2 ms tick that keeps the loop busy, so every bucket timer fires late.
+  const load = setInterval(() => { const end = Date.now() + 1; while (Date.now() < end); }, 2);
+  try {
+    const rooms = await relayBurst(relay, frames, {}, { sendRate: 200, sendBurst: 1 }, 260);
+    try {
+      // 200 frames at 200/s span 199 / 200 ≈ 1.0 s ; the bucket that reset after each wait took ≥ 1.15 s.
+      const span = dataSpan(frames, 200);
+      assert.ok(span >= 0.9 && span <= 1.1, `200 frames in ${span} s at sendRate 200 under load`);
+    } finally {
+      leaveAll(rooms);
+    }
+  } finally {
+    clearInterval(load);
+    await relay.close();
+  }
+});

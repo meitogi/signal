@@ -59,12 +59,13 @@ reconnecte seule (0,5 s, 1 s, 2 s… jusqu'à 30 s) et émet `error` à chaque �
 | `room` | **obligatoire** | nom choisi par l'app, 1 à 64 caractères ; le relay ne le voit jamais |
 | `secret` | **obligatoire** | sortie de `newSecret()` : 32 octets en base64url (43 caractères) |
 | `max` | `8` | peers max, soi compris (≥ 2). Fixé par celui qui **crée** la room, plafonné par le relay |
-| `relayKey` | — | clé d'accès si le relay est privé (`RELAY_KEY`) |
-| `iceServers` | STUN Google | `[]` pour n'utiliser aucun serveur STUN |
+| `relayKey` | — | clé d'accès si le relay est privé (une clé par application, `RELAY_KEYS`) |
+| `iceServers` | STUN Google | `[]` pour n'utiliser aucun serveur STUN (navigateur et Node) |
 | `fallback` | `true` | si le direct échoue, passer les messages par le relay (chiffrés, plus lents) |
 | `connectMs` | `20000` | délai pour établir le direct avec un peer, avant repli ou abandon |
 | `handshakeMs` | `10000` | délai pour que la preuve du secret aboutisse |
 | `maxMessageBytes` | `1048576` | taille max d'un message envoyé **ou reçu** (1 Mio) |
+| `sendRate` / `sendBurst` | `100` / `200` | messages/s vers le relay (signalisation + repli), un seau par `joinRoom()` ; plafonné à 5/6 du débit que le `welcome` du relay accorde |
 
 ### Room et Peer
 
@@ -76,6 +77,7 @@ reconnecte seule (0,5 s, 1 s, 2 s… jusqu'à 30 s) et émet `error` à chaque �
 | `room.leave()` | quitte, ferme tout ; `close` émis avec `null` |
 | `peer.id`, `peer.via` | `'direct'` (WebRTC) ou `'relay'` (repli) |
 | `peer.send(data)` | `string`, `Uint8Array` ou `ArrayBuffer` ; découpé et recollé au-delà de 16 Ko ; **attend** si la file d'envoi est pleine ; rejette `too-big` / `closed` |
+| `peer.send(data, { reliable: false })` | une trame (≤ 16 Ko) sur un canal sans ordre ni renvoi ; n'attend jamais : `true` si parti, `false` si jeté (plus de 64 Ko en attente) ; par le relay, chemin fiable. Détail : [CONTRACT.md](CONTRACT.md#envoi-non-fiable--peersenddata--reliable-false-) |
 | `peer.on('message', fn)` | `string` si l'autre a envoyé une chaîne, sinon `Uint8Array` |
 | `peer.on('close', fn)` | `fn(reason)` : `closed` (fermé par l'un ou l'autre), `relay` (peer de repli perdu avec le relay), `peer-rate`, `too-big` |
 | `peer.close()` | coupe ce peer seulement |
@@ -88,9 +90,9 @@ Pas de JSON imposé : `peer.send(JSON.stringify(obj))` et `JSON.parse(data)` cô
 import { formatLink, parseLink } from '@meitogi/signal';
 
 formatLink('https://mon-app.example/', { room: 'partie-du-soir', secret });
-// → https://mon-app.example/#r=partie-du-soir&s=<secret>      (+ &relay=… si donné)
+// → https://mon-app.example/#r=partie-du-soir&s=<secret>      (+ &relay=…, &key=… si donnés)
 
-parseLink(location.href); // → { room, secret, relay? } ou null
+parseLink(location.href); // → { room, secret, relay?, relayKey? } ou null — à étaler dans joinRoom()
 ```
 
 Tout est après `#` : le navigateur n'envoie jamais cette partie au serveur web.
@@ -187,12 +189,13 @@ client).
 | Variable | Défaut | |
 |---|---|---|
 | `PORT` / `HOST` | `8787` / `0.0.0.0` | |
-| `RELAY_KEY` | vide | clé d'accès ; vide = relay ouvert à tous |
+| `RELAY_KEYS` | vide | une clé par application : `nom:clé[:débit[:rafale]]`, séparées par des virgules |
+| `RELAY_KEY` | vide | une seule clé (`default`) ; ni elle ni `RELAY_KEYS` = relay ouvert à tous |
 | `RELAY_ROOM_MAX` | `8` | plafond du `max` d'une room |
 | `RELAY_MAX_BYTES` | `16384` | taille max d'un message ; au-delà, coupé (1009) |
 | `RELAY_HELLO_MS` | `5000` | délai pour recevoir le `hello` |
 | `RELAY_IDLE_MS` | `30000` | silence max après le `hello` |
-| `RELAY_RATE` / `RELAY_BURST` | `120` / `240` | messages par seconde par connexion |
+| `RELAY_RATE` / `RELAY_BURST` | `120` / `240` | messages par seconde par connexion (avant le `hello`, relay ouvert, ancien protocole, clé sans débit à elle) |
 | `RELAY_OFFERS_PER_MIN` | `6` | offres max d'un peer vers un même peer |
 | `RELAY_IP_CONN` | `10` | connexions simultanées par IP |
 | `RELAY_PENDING_MAX` | `200` | connexions sans `hello`, au total |
@@ -216,7 +219,7 @@ client).
   réception) ; pas de `hello` valide en `RELAY_HELLO_MS` ou un premier message qui
   n'en est pas un (4401) ; un `hello` mal formé (4400) ; une room pleine (4403) ;
   un id déjà pris dans la room (4409) ; un débit au-delà de `RELAY_RATE` /
-  `RELAY_BURST`, ou plus de `RELAY_OFFERS_PER_MIN` offres vers un même peer
+  `RELAY_BURST` (ou du débit de sa clé), ou plus de `RELAY_OFFERS_PER_MIN` offres vers un même peer
   (4429) ; un silence de `RELAY_IDLE_MS` après le `hello` (4408). Un socket mort
   est détecté par un ping WebSocket toutes les 30 s.
 - **Ban** : les fermetures 4400, 4401, 4429, 1009 et les refus au-delà de
@@ -280,21 +283,40 @@ sur un téléphone, en 4G ou sur le même Wi-Fi), puis vérifie des deux côtés
 chemin direct (candidats, paire choisie), le repli par le relay forcé (le second
 arrivant entre avec `connectMs: 1`) et son débit, les échos texte et octets, un
 gros message fragmenté sur chaque chemin, et mesure une cadence de jeu (paquets
-à 30 / 60 / 120 Hz, avec ou sans regroupement par tick de 20 ms : RTT, gigue,
-pertes). À lancer en natif (pas dans un conteneur Docker Desktop, qui n'a pas de
+à 30 / 60 / 120 Hz, avec ou sans regroupement par tick de 20 ms, fiable et — sur le
+chemin direct — non fiable : RTT, gigue, paquets jamais revenus et en retard comptés à part).
+`RELAY_KEY` passe la clé du relay dans le lien (et vérifie qu'une mauvaise est refusée),
+`SEND_RATE` / `SEND_BURST` règlent le débit des deux côtés. À lancer en natif (pas dans un conteneur Docker Desktop, qui n'a pas de
 chemin direct) ; les options sont en tête du fichier. Chaque passage est enregistré dans
 `deploy/test/results/` (ignoré par git : il contient des IP publiques) au nom de l'appareil et du
 réseau (`ios-18.7-safari-18.7_other-net`, `macos-brave_same-net`…), avec une ligne de plus dans
 `results.md` pour comparer les passages.
 
-### La clé d'accès
+### Les clés d'accès
 
-Avec `RELAY_KEY`, le premier message d'une connexion doit être son `hello`, avec
-`key`. Une mauvaise clé, un autre premier message, ou pas de `hello` à temps
-ferment le socket en 4401. La comparaison est en temps constant. La clé n'est ni
-un en-tête ni une query string : un navigateur ne peut pas poser d'en-tête sur un
-WebSocket, et les query strings finissent dans les logs des proxies. Pour en
-changer : modifier `RELAY_KEY`, redémarrer.
+```
+RELAY_KEYS=debrid-remote:<clé>:120:240,signal-test-page:<clé>:30:60,mmo:<clé>:400:800
+```
+
+Une clé par application, chacune avec son débit et sa rafale **par connexion** (à défaut,
+`RELAY_RATE` / `RELAY_BURST`). Le premier message d'une connexion doit être son `hello`, avec
+`key`. Une clé inconnue, un autre premier message, ou pas de `hello` à temps ferment le socket
+en 4401. La connexion démarre avec le seau par défaut ; sa clé reconnue, elle passe au seau de
+la clé, plein, et le `welcome` lui annonce `rate` / `burst` (le client se tient à 5/6). La
+comparaison est en temps constant, contre chaque clé de la liste. Le journal nomme la clé
+(`key=mmo`), jamais sa valeur ; une liste mal formée ou des doublons empêchent le démarrage,
+sans afficher de clé.
+
+`RELAY_KEY` seule reste possible : une liste d'une clé, `default`, au débit par défaut.
+`RELAY_KEY` et `RELAY_KEYS` ensemble : le relay refuse de démarrer. Avec `RELAY_LEGACY=1`,
+l'ancien protocole entre sans clé.
+
+La clé n'est ni un en-tête ni une query string : un navigateur ne peut pas poser d'en-tête
+sur un WebSocket, et les query strings finissent dans les logs des proxies. Elle est vérifiée
+au `hello` seulement : pour en ajouter, en changer ou en retirer une, modifier la variable et
+redémarrer ; les rooms se reconnectent seules. **Relever les débits du relay avant ceux des
+clients** : un client qui envoie plus que ce que le relay accorde voit ses messages jetés en
+silence, puis 4429, puis son IP bannie.
 
 ### Certificat renouvelé
 
@@ -311,7 +333,8 @@ L'ancien protocole ouvert (`{type:'hello', id, name?, kind?}`, sans `v` ni `room
 est accepté dans une room à part, `""`, avec `name` / `kind` dans les listes et
 `signal` transmis tel quel. Les clients v1 et les anciens ne se voient jamais.
 Cette room n'a pas de `max` et pas de délai de silence (un ancien serveur
-n'envoie rien après son `hello`). Les autres limites s'appliquent. À couper
+n'envoie rien après son `hello`), et ses clients n'ont pas de clé à présenter, même sur un
+relay à clés. Les autres limites s'appliquent. À couper
 quand les anciens clients ont migré.
 
 ### Embarquer le relay
@@ -323,7 +346,8 @@ const relay = await createRelay({ port: 8787, key: process.env.RELAY_KEY });
 // relay.port, relay.stats(), relay.close()
 ```
 
-Les options reprennent les variables ci-dessus (`roomMax`, `maxBytes`, `helloMs`,
+Les options reprennent les variables ci-dessus (`key`, `keys` : un tableau
+`[{ name, key, rate?, burst? }]` — `parseKeys(RELAY_KEYS)` le lit —, `roomMax`, `maxBytes`, `helloMs`,
 `idleMs`, `rate`, `burst`, `offersPerMin`, `ipConn`, `pendingMax`, `connMax`,
 `banAfter`, `banMs`, `trustProxy`, `legacy`, `tls`) ; détail dans
 [src/relay.js](src/relay.js).

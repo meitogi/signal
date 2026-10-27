@@ -2,9 +2,11 @@
 // backoff, a new id on 4409, close codes read as SignalErrors (errors.js), and the sealed envelope
 // around every `signal` and `data` box. Nothing here knows about WebRTC.
 //
-// Outgoing messages share one token bucket (SEND_RATE / SEND_BURST, under the relay's 120 / 240) :
+// Outgoing messages share one token bucket per session (`sendRate` / `sendBurst`, 100 / 200 by default) :
 // a message waits for its token, it is never dropped, and sealing happens in send order so the
-// receiver's counter check holds. Incoming boxes are opened in arrival order for the same reason.
+// receiver's counter check holds. The relay's `welcome` says what it grants this socket ; the bucket
+// then stays at GRANT_SHARE of it, so the relay never drops our frames (its own bucket is silent
+// before its 4429). Incoming boxes are opened in arrival order for the same reason.
 import { b64u, createSealer, newId } from './crypto.js';
 import { Emitter } from './emitter.js';
 import { closeError, SignalError } from './errors.js';
@@ -12,8 +14,10 @@ import { closeError, SignalError } from './errors.js';
 const PING_MS = 5000;
 const BACKOFF_MIN_MS = 500;
 const BACKOFF_MAX_MS = 30_000;
-const SEND_RATE = 100;
-const SEND_BURST = 200;
+export const SEND_RATE = 100;
+export const SEND_BURST = 200;
+/** Share of the relay's grant the bucket may use : 100 / 120 and 200 / 240 against its defaults. */
+const GRANT_SHARE = 5 / 6;
 const SIGNAL_KINDS = { offer: true, answer: true, ice: true };
 const utf8 = new TextEncoder();
 const decoder = new TextDecoder();
@@ -25,13 +29,15 @@ const decoder = new TextDecoder();
  * @param {string} o.roomId - the HKDF room id
  * @param {number} o.max
  * @param {string} [o.key] - relayKey
+ * @param {number} [o.sendRate=SEND_RATE] - messages per second to the relay, sustained
+ * @param {number} [o.sendBurst=SEND_BURST] - messages at once
  * @param {CryptoKey} o.seal
  * @returns {Emitter & {id: string, start(): void, stop(): Promise<void>, signal, data, block}}
  *   events : 'welcome' ({peers, max, creator, first}), 'peers' (list), 'signal' ({from, kind, inner}),
  *   'data' ({from, bytes}), 'rejected' ({from, why}) — a box dropped and its sender blocked,
  *   'down' (SignalError, non-fatal : reconnecting), 'fatal' (SignalError : stopped for good)
  */
-export function createRelaySession({ WebSocket, url, roomId, max, key, seal }) {
+export function createRelaySession({ WebSocket, url, roomId, max, key, sendRate = SEND_RATE, sendBurst = SEND_BURST, seal }) {
   const session = new Emitter();
   let id = newId();
   let sealer = createSealer(seal, roomId, id);
@@ -43,7 +49,9 @@ export function createRelaySession({ WebSocket, url, roomId, max, key, seal }) {
   let stopped = false;
   let outbox = Promise.resolve();
   let inbox = Promise.resolve();
-  let tokens = SEND_BURST;
+  let rate = sendRate;
+  let burst = sendBurst;
+  let tokens = burst;
   let stamp = Date.now();
 
   session.id = id;
@@ -52,17 +60,16 @@ export function createRelaySession({ WebSocket, url, roomId, max, key, seal }) {
     if (ws !== null && ws.readyState === 1) ws.send(JSON.stringify(obj));
   };
 
-  /** Resolves once a token is available ; FIFO through `outbox`. */
+  /**
+   * Resolves once the message may go ; FIFO through `outbox`. The token is taken at once and a deficit
+   * is waited off : a timer that fires late is refilled by the next call, so the rate holds under load.
+   */
   function acquire() {
     const now = Date.now();
-    tokens = Math.min(SEND_BURST, tokens + ((now - stamp) * SEND_RATE) / 1000);
+    tokens = Math.min(burst, tokens + ((now - stamp) * rate) / 1000) - 1;
     stamp = now;
-    if (tokens >= 1) {
-      tokens--;
-      return Promise.resolve();
-    }
-    const wait = Math.ceil(((1 - tokens) * 1000) / SEND_RATE);
-    return new Promise((resolve) => setTimeout(() => { tokens = 0; stamp = Date.now(); resolve(); }, wait));
+    if (tokens >= 0) return Promise.resolve();
+    return new Promise((resolve) => setTimeout(resolve, Math.ceil((-tokens * 1000) / rate)));
   }
 
   const enqueue = (work) => {
@@ -77,11 +84,19 @@ export function createRelaySession({ WebSocket, url, roomId, max, key, seal }) {
     sendRaw({ ...frame, to, box });
   });
 
+  /** Our bucket within GRANT_SHARE of what the relay grants ; a relay that says nothing leaves our options. */
+  function fitGrant(granted, wanted) {
+    return Number.isInteger(granted) && granted > 0 ? Math.min(wanted, granted * GRANT_SHARE) : wanted;
+  }
+
   async function onMessage(msg) {
     if (stopped) return; // queued behind stop() : the room is over, nothing restarts
     const type = msg.type;
     if (type === 'welcome') {
       backoff = BACKOFF_MIN_MS;
+      rate = fitGrant(msg.rate, sendRate);
+      burst = fitGrant(msg.burst, sendBurst);
+      tokens = Math.min(tokens, burst);
       const first = !entered;
       entered = true;
       session.emit('welcome', { peers: msg.peers ?? [], max: msg.max, creator: msg.creator === true, first });

@@ -5,7 +5,7 @@ import { randomBytes } from 'node:crypto';
 import { b64u, createSealer, deriveRoom } from '../src/crypto.js';
 import { NodePeerConnection, NodeWebSocket, platform } from '../src/node-platform.js';
 import { createRelay } from '../src/relay.js';
-import { createClient } from '../src/room.js';
+import { createClient, UNRELIABLE } from '../src/room.js';
 import { join } from './helpers.js';
 
 const utf8 = new TextEncoder();
@@ -56,6 +56,21 @@ export function metered(stats, base = platform) {
     }
   }
   return { ...base, RTCPeerConnection: Metered };
+}
+
+/** A platform that records every DataChannel its connections create or receive, as `{how, label, channel}`. */
+export function recorded(list, base = platform) {
+  class Recorded extends base.RTCPeerConnection {
+    createDataChannel(label, options) {
+      const channel = super.createDataChannel(label, options);
+      list.push({ how: 'created', label, channel });
+      return channel;
+    }
+    addEventListener(type, fn, options) {
+      super.addEventListener(type, type === 'datachannel' ? (e) => { list.push({ how: 'received', label: e.channel.label, channel: e.channel }); fn(e); } : fn, options);
+    }
+  }
+  return { ...base, RTCPeerConnection: Recorded };
 }
 
 /** A platform whose socket never sends a `ping` : the relay cuts it for idleness (4408). */
@@ -125,6 +140,9 @@ export async function attacker(relayUrl, { room, secret }, id = `evil-${randomBy
   const sealer = createSealer(seal, roomId, id);
   const ws = await join(relayUrl, { v: 1, id, room: roomId });
   const pcs = [];
+  // The counter is taken when sealing starts, the box is ready later : sends go one at a time, in
+  // sealing order (as relay-session.js does), or the victim sees a counter go back and blocks us.
+  let outbox = Promise.resolve();
   const self = {
     id,
     ws,
@@ -132,11 +150,15 @@ export async function attacker(relayUrl, { room, secret }, id = `evil-${randomBy
     auth,
     sealer,
     /** Seals `inner` for `to` and sends it under the cleartext `kind` ; returns the box bytes. */
-    async signal(to, kind, inner, { tamper = false } = {}) {
-      const box = await sealer.seal(to, utf8.encode(JSON.stringify(inner)));
-      if (tamper) box[box.length - 1] ^= 1;
-      ws.send({ type: 'signal', to, kind, box: b64u.encode(box) });
-      return box;
+    signal(to, kind, inner, { tamper = false } = {}) {
+      const sent = outbox.then(async () => {
+        const box = await sealer.seal(to, utf8.encode(JSON.stringify(inner)));
+        if (tamper) box[box.length - 1] ^= 1;
+        ws.send({ type: 'signal', to, kind, box: b64u.encode(box) });
+        return box;
+      });
+      outbox = sent.catch(() => {});
+      return sent;
     },
     sendBox(to, kind, box) { ws.send({ type: 'signal', to, kind, box: b64u.encode(box) }); },
     /** The next signal from anyone, opened. */
@@ -146,18 +168,22 @@ export async function attacker(relayUrl, { room, secret }, id = `evil-${randomBy
       assert.ok(plain, 'a signal we could not open');
       return { ...msg, inner: JSON.parse(decoder.decode(plain)) };
     },
-    /** A real offer to `to` (werift behind it) ; `complete()` applies the answer and candidates until the channel opens. */
-    async offer(to, { iceServers = [] } = {}) {
+    /**
+     * A real offer to `to` (werift behind it) ; `complete()` applies the answer and candidates until the channel opens.
+     * `unreliable` also opens the pre-negotiated unreliable channel, as `o.unreliable`.
+     */
+    async offer(to, { iceServers = [], unreliable = false } = {}) {
       const pc = new NodePeerConnection({ iceServers });
       pcs.push(pc);
       const channel = pc.createDataChannel('signal');
+      const lossy = unreliable ? pc.createDataChannel(UNRELIABLE.label, UNRELIABLE.options) : null;
       const offer = await pc.createOffer();
       const nonce = b64u.encode(randomBytes(16));
       const opened = new Promise((r) => channel.addEventListener('open', r, { once: true }));
       pc.addEventListener('icecandidate', ({ candidate }) => self.signal(to, 'ice', { kind: 'ice', candidate }));
       const box = await self.signal(to, 'offer', { kind: 'offer', sdp: offer.sdp, nonce });
       await pc.setLocalDescription(offer);
-      const o = { pc, channel, sdp: offer.sdp, nonce, box, answer: null, opened };
+      const o = { pc, channel, unreliable: lossy, sdp: offer.sdp, nonce, box, answer: null, opened };
       o.complete = async (ms = 5000) => {
         const end = Date.now() + ms;
         while (o.answer === null || channel.readyState !== 'open') {

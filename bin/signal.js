@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // `npx @meitogi/signal` — runs the relay from the environment. Variables : README.md / CONTRACT.md.
 import { readFileSync, watchFile } from 'node:fs';
-import { createRelay } from '../src/relay.js';
+import { createRelay, parseKeys } from '../src/relay.js';
 
 const env = process.env;
 
@@ -14,6 +14,22 @@ function envInt(name, fallback) {
     process.exit(1);
   }
   return n;
+}
+
+// RELAY_KEYS : one key per application, each with its own rate (README « Lancer un relay »).
+// RELAY_KEY alone stays a list of one ; both at once is a configuration mistake.
+let keys;
+if (env.RELAY_KEYS) {
+  if (env.RELAY_KEY) {
+    console.error('@meitogi/signal : RELAY_KEY and RELAY_KEYS are both set ; keep one (RELAY_KEY alone = a list of one key)');
+    process.exit(1);
+  }
+  try {
+    keys = parseKeys(env.RELAY_KEYS);
+  } catch (e) {
+    console.error(`@meitogi/signal : ${e.message}`);
+    process.exit(1);
+  }
 }
 
 const readTls = () => ({ cert: readFileSync(env.TLS_CERT), key: readFileSync(env.TLS_KEY) });
@@ -39,6 +55,7 @@ createRelay({
   port: envInt('PORT', 8787),
   host: env.HOST || '0.0.0.0',
   key: env.RELAY_KEY || '',
+  keys,
   tls,
   roomMax: envInt('RELAY_ROOM_MAX', 8),
   maxBytes: envInt('RELAY_MAX_BYTES', 16384),

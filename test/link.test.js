@@ -31,6 +31,16 @@ test('formatLink / parseLink round-trip, fragment replaced, relay optional', () 
   assert.equal(parseLink(`https://app.example/#s=${secret}`), null, 'no room');
 });
 
+test('formatLink / parseLink : an optional relay key travels as `key`, read back as relayKey', () => {
+  const secret = newSecret();
+  const link = formatLink('https://app.example/', { room: 'r', secret, relay: 'wss://relay.example', relayKey: 'k-123_ABC' });
+  assert.equal(link, `https://app.example/#r=r&s=${secret}&relay=wss%3A%2F%2Frelay.example&key=k-123_ABC`);
+  assert.deepEqual(parseLink(link), { room: 'r', secret, relay: 'wss://relay.example', relayKey: 'k-123_ABC' });
+  assert.deepEqual(parseLink(`#r=r&s=${secret}&key=abc`), { room: 'r', secret, relayKey: 'abc' });
+  assert.deepEqual(parseLink(`#r=r&s=${secret}&key=`), { room: 'r', secret }, 'an empty key is no key');
+  assert.equal(formatLink('https://app.example/', { room: 'r', secret, relayKey: '' }), `https://app.example/#r=r&s=${secret}`);
+});
+
 test('joinRoom : invalid options reject ready and close the room without touching the network', async () => {
   let sockets = 0;
   const { joinRoom } = createClient({
@@ -49,6 +59,11 @@ test('joinRoom : invalid options reject ready and close the room without touchin
     [{ relay: 'wss://relay.example', room: 'r', secret, max: '4' }, 'options'],
     [{ relay: 'wss://relay.example', room: 'r', secret, connectMs: 0 }, 'options'],
     [{ relay: 'wss://relay.example', room: 'r', secret, iceServers: 'stun' }, 'options'],
+    [{ relay: 'wss://relay.example', room: 'r', secret, sendRate: 0 }, 'options'],
+    [{ relay: 'wss://relay.example', room: 'r', secret, sendRate: 1.5 }, 'options'],
+    [{ relay: 'wss://relay.example', room: 'r', secret, sendRate: '100' }, 'options'],
+    [{ relay: 'wss://relay.example', room: 'r', secret, sendBurst: -1 }, 'options'],
+    [{ relay: 'wss://relay.example', room: 'r', secret, sendBurst: 0 }, 'options'],
     [{ relay: 'wss://relay.example', room: 'r' }, 'secret'],
     [{ relay: 'wss://relay.example', room: 'r', secret: 'short' }, 'secret'],
     [{ relay: 'ws://localhost:8787', room: 'r', secret: `${secret.slice(0, 42)}=` }, 'secret'],
