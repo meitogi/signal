@@ -26,21 +26,31 @@ async function flood(port, count, headersOf = () => ({})) {
 
 const xff = (i) => `10.${(i >> 16) & 255}.${(i >> 8) & 255}.${i & 255}`;
 
-test(`${FLOOD} silent sockets from one IP : ${10} in, the rest 429 then banned ; memory bounded ; another IP still served`, async (t) => {
+// A refusal at the per-IP cap is no fault : a home behind one IP (or a carrier NAT) that opens one
+// room too many must not get banned, with every other device behind it. The flooder's held
+// sockets still are faults once they miss the hello delay (4401).
+test(`${FLOOD} silent sockets from one IP : ${10} in, the rest 429, no ban for the cap ; memory bounded ; another IP still served`, async (t) => {
   const relay = await spawnRelay({ RELAY_HELLO_MS: '60000' });
   t.after(relay.stop);
+  const url = `ws://127.0.0.1:${relay.port}`;
   const rss0 = await relay.rssMb();
   const { statuses, sockets } = await flood(relay.port, FLOOD);
   t.after(() => { for (const s of sockets) s.destroy(); });
   assert.deepEqual(statuses, { 101: 10, 429: FLOOD - 10 }, 'RELAY_IP_CONN=10 sockets, then 429 before any WebSocket');
-  await relay.waitLog(/ban 127\.0\.0\.1 for 600 s/);
   const grown = (await relay.rssMb()) - rss0;
   assert.ok(grown < RSS_BUDGET_MB, `RSS grew ${grown.toFixed(1)} MB`);
   assert.ok(relay.alive());
-  // 127.0.0.1 is banned : a client from 127.0.0.2 (another loopback IP) is served.
-  await assertServing(`ws://127.0.0.1:${relay.port}`, {}, { localAddress: '127.0.0.2' });
-  const banned = connect(`ws://127.0.0.1:${relay.port}`);
-  assert.equal(await banned.opened, 429, 'the banned IP is refused even with a legit client');
+  await assertServing(url, {}, { localAddress: '127.0.0.2' });
+  // The 10 held sockets leave : 127.0.0.1 gets in again, it was never banned.
+  for (const s of sockets) s.destroy();
+  let served = false;
+  for (const end = Date.now() + 5000; !served && Date.now() < end; await sleep(100)) {
+    const probe = connect(url);
+    served = (await probe.opened) === 101;
+    probe.ws.terminate();
+  }
+  assert.ok(served, 'the full IP is served again once its sockets left');
+  assert.ok(!/ ban /.test((await relay.waitLog(/[\s\S]*/))[0]), 'no ban for refusals at the cap');
 });
 
 test(`${FLOOD} silent sockets from many X-Forwarded-For IPs behind a trusted proxy : RELAY_PENDING_MAX in, the rest 429, no ban ; the legit client is 429 cleanly, then gets in`, async (t) => {

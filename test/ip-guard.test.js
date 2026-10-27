@@ -37,7 +37,19 @@ test('slots : pending, total and per-IP counts come back to zero', (t) => {
   for (const slot of [a, b, c, d]) guard.release(slot);
   const s = guard.stats();
   assert.deepEqual([s.pending, s.total], [0, 0]);
-  assert.equal(s.ips, 1, 'only 192.0.2.1 is remembered, for its per-IP fault');
+  assert.equal(s.ips, 0, 'a per-IP refusal is no fault : nothing to remember once released');
+});
+
+test('a full IP is refused, never banned for it : its next socket gets in once one leaves', (t) => {
+  const guard = make({ ipConn: 1, banAfter: 1 });
+  t.after(guard.close);
+  const held = guard.admit('192.0.2.1');
+  for (let i = 0; i < 20; i++) assert.equal(guard.admit('192.0.2.1'), 'ip');
+  guard.release(held);
+  const next = guard.admit('192.0.2.1');
+  assert.equal(typeof next, 'object', `got ${next} : refusals at the cap counted as faults`);
+  assert.equal(next.ip, '192.0.2.1');
+  guard.release(next);
 });
 
 test('IP table : a flood of IPs with one fault each stays bounded, bans are kept', (t) => {

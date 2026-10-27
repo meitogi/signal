@@ -222,11 +222,11 @@ client).
   `RELAY_BURST` (ou du débit de sa clé), ou plus de `RELAY_OFFERS_PER_MIN` offres vers un même peer
   (4429) ; un silence de `RELAY_IDLE_MS` après le `hello` (4408). Un socket mort
   est détecté par un ping WebSocket toutes les 30 s.
-- **Ban** : les fermetures 4400, 4401, 4429, 1009 et les refus au-delà de
-  `RELAY_IP_CONN` comptent comme fautes. `RELAY_BAN_AFTER` fautes en 10 min
+- **Ban** : les fermetures 4400, 4401, 4429 et 1009 comptent comme fautes. `RELAY_BAN_AFTER` fautes en 10 min
   bannissent l'IP pour `RELAY_BAN_MS`, puis le double à chaque récidive (la
-  récidive est oubliée 24 h après la fin du ban). Room pleine, id pris, silence et
-  plafonds globaux ne sont pas des fautes : ce n'est pas la faute de l'IP.
+  récidive est oubliée 24 h après la fin du ban). Room pleine, id pris, silence,
+  plafond par IP et plafonds globaux ne sont pas des fautes : ce n'est pas la faute de l'IP (une
+  maison ou un opérateur mobile mettent beaucoup d'appareils derrière une IP).
 
 Le but : le relay ne tombe jamais ; au pire, il refuse les nouveaux venus.
 

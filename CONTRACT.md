@@ -1,12 +1,12 @@
-# @meitogi/signal — contrat v1 (brouillon)
+# @meitogi/signal — contrat v1
 
-Ce document décrit ce que le paquet `@meitogi/signal` fera, assez précisément pour
-écrire le code d'une application **avant** sa publication. Le paquet sera codé
-contre ce contrat ; si un point change, ce document change avec, et la ligne
-« Changements » en bas le dit.
+Ce document décrit ce que fait le paquet `@meitogi/signal`, assez précisément pour
+écrire le code d'une application contre lui. Si un point change, ce document change
+avec, et la ligne « Changements » en bas le dit.
 
-> **Statut** : brouillon, rien n'est publié. Les noms, les options et les codes
-> d'erreur ci-dessous sont ceux visés pour la version 0.1.0.
+> **Statut** : utilisable, version 0.1.0, installée depuis GitHub (pas encore sur npm, voir
+> « Installer »). Le relay en ligne `wss://signal.du.ranchchoco.boo` parle ce protocole et
+> demande une clé par application.
 
 ## En une phrase
 
@@ -25,8 +25,13 @@ personne d'autre ne puisse lire, entrer ou se faire passer pour l'un d'eux.
 ## Installer
 
 ```
-npm install @meitogi/signal
+npm install github:meitogi/signal#v0.1.0
 ```
+
+En attendant sa publication sur npm, le paquet s'installe depuis son dépôt, épinglé sur un tag :
+le code est livré tel quel (pas d'étape de build), `werift` et `ws` s'installent avec. Les imports
+sont les mêmes ; le jour où il arrive sur npm (`npm install @meitogi/signal`), seule la ligne du
+`package.json` change.
 
 | Import | Où | Pour |
 |---|---|---|
@@ -180,6 +185,53 @@ ne retarde pas les suivants.
 Sans option (ou `reliable: true`), `send()` reste fiable et ordonné, et sa promesse se résout sans
 valeur.
 
+## Plusieurs rooms à la fois
+
+- **Une room = une connexion au relay**, ouverte de `joinRoom()` à `room.leave()` (ou à la fin de
+  la page / du process). Elle reste ouverte pour accueillir un nouveau venu, se reconnecter, et
+  porter le repli. Au repos : un ping toutes les 5 s.
+- **Le débit est par connexion** : chaque `joinRoom()` a son propre seau (`sendRate` /
+  `sendBurst`) et le relay lui accorde le débit de sa clé. Dix rooms ne se partagent pas un débit.
+- **Une room relie tout le monde à tout le monde** (au plus `max`, plafonné par
+  `RELAY_ROOM_MAX`, 8 par défaut). Pour des liens séparés, une room par lien, chacune avec son
+  secret :
+
+  ```
+  A1 ⇄ B1, A2 ⇄ B2          deux rooms : chaque paire la sienne
+  A1 ⇄ B1, A2 ⇄ B1          B1 fait deux joinRoom(), un par A : A1 et A2 ne se voient pas
+  A1, A2, B1 ensemble       une room max: 3 : A1 et A2 se connectent aussi entre eux
+  ```
+
+- **Plafond par IP** : le relay accepte au plus `RELAY_IP_CONN` connexions ouvertes par IP publique
+  (30 sur le relay en ligne). Une maison derrière sa box, ou des téléphones en 4G derrière le NAT de
+  l'opérateur, partagent ce plafond. Au-delà, la connexion est refusée (`429`) ; ce refus **n'est
+  pas une faute** et ne mène jamais à un ban. Un navigateur ne voit pas le `429` : la room réessaie
+  seule. Côté Node, à l'entrée, il donne `banned` (le relay ne dit pas si l'IP est bannie ou
+  pleine) : réessayer plus tard est alors à l'app.
+
+## Repli par le relay
+
+Quand le direct n'aboutit pas en `connectMs` (20 s), et avec `fallback: true`, les messages vers ce
+peer passent par le relay : `peer.via === 'relay'`. Le relay ne voit que des boîtes chiffrées.
+
+- **Fiable et ordonné**, même pour `{ reliable: false }`.
+- **Coût** : un message de l'app = une trame par tranche de 11 Ko, et `room.broadcast()` = une trame
+  **par peer en repli** (chaque boîte est chiffrée pour son destinataire). Ces trames passent par le
+  seau de la connexion (100 / s par défaut), signalisation comprise.
+- **Au-delà du seau, un message attend**, il n'est jamais jeté : la latence monte. Pour un jeu,
+  envoyer **un message par tick** (tout ce qui a changé), pas un par événement :
+
+  | messages / s par peer | 2 peers | 4 peers | 8 peers |
+  |---|---|---|---|
+  | 10 | 10 / s | 30 / s | 70 / s |
+  | 20 | 20 / s | 60 / s | 140 / s : attend |
+  | 30 | 30 / s | 90 / s | 210 / s : attend |
+
+  (messages / s × peers en repli, contre 100 / s.) Au-delà, demander à l'exploitant du relay un débit
+  plus haut pour sa clé, puis monter `sendRate` / `sendBurst` : le client se tient de lui-même à 5/6
+  de ce que le relay accorde.
+- **Côté réception**, chaque côté coupe un peer au-delà de 1000 trames / s (`peer-rate`).
+
 ## Erreurs
 
 Toutes les erreurs sont des `SignalError` avec un `code` :
@@ -261,7 +313,7 @@ dépôt) ou avec `TLS_CERT` / `TLS_KEY`.
 | `RELAY_IDLE_MS` | `30000` | silence max après le `hello` |
 | `RELAY_RATE` / `RELAY_BURST` | `120` / `240` | messages par seconde par connexion : avant le `hello`, sur un relay ouvert, pour l'ancien protocole, et pour une clé sans débit à elle |
 | `RELAY_OFFERS_PER_MIN` | `6` | offres max d'un peer vers un même peer |
-| `RELAY_IP_CONN` | `10` | connexions simultanées par IP |
+| `RELAY_IP_CONN` | `10` | connexions simultanées par IP ; au-delà, refus `429`, qui n'est pas une faute (voir « Plusieurs rooms à la fois ») |
 | `RELAY_PENDING_MAX` | `200` | connexions sans `hello`, au total |
 | `RELAY_CONN_MAX` | `2000` | connexions au total |
 | `RELAY_BAN_AFTER` / `RELAY_BAN_MS` | `5` / `600000` | 5 fautes en 10 min → ban de 10 min, doublé à chaque récidive |
@@ -313,17 +365,17 @@ au-delà de `RELAY_IDLE_MS`, 4409 id pris, 4429 débit ou trop d'offres, 1009
 message trop gros. Une IP bannie ou au-delà des plafonds reçoit
 un HTTP 429 avant même le WebSocket.
 
-## Coder avant la publication
+## Coder avec
 
 - Écrire le code de l'app contre ce contrat : `joinRoom`, les événements, les
   codes d'erreur. **Ne pas réimplémenter le protocole** : le chiffrement et la
   preuve sont la partie qu'on ne veut écrire qu'une fois.
-- Le relay en ligne `wss://signal.du.ranchchoco.boo` parle encore l'ancien
-  protocole ; il passera à la v1 après la sortie du paquet. Pour tester avant,
-  lancer un relay local (`npx @meitogi/signal`, puis `relay: 'ws://localhost:8787'`).
-- Avant la publication npm, le paquet sera fourni en archive :
-  `npm install ./meitogi-signal-0.1.0.tgz`. Rien d'autre à changer le jour où il
-  arrive sur npm.
+- Le relay en ligne `wss://signal.du.ranchchoco.boo` parle ce protocole (v1, plus l'ancien pour
+  ses anciens clients) et demande une `relayKey` : une par application, donnée par son exploitant.
+  Une clé refusée est une faute pour le relay (`key`, fatale, la room ne réessaie pas) : cinq en
+  10 min bannissent l'IP. Ne pas boucler sur `joinRoom()` après un `key`.
+- Pour tester sans clé, lancer un relay local (`npx github:meitogi/signal#v0.1.0`, puis
+  `relay: 'ws://localhost:8787'`).
 
 ## Changements
 
@@ -343,3 +395,7 @@ un HTTP 429 avant même le WebSocket.
   sur un canal sans ordre ni renvoi (une trame, jamais d'attente, chemin fiable par le relay) ;
   `formatLink` / `parseLink` portent `relayKey` (`&key=`) ; `iceServers: []` n'interroge plus
   aucun serveur STUN côté Node. Rien ne change pour une app qui n'utilise pas ces nouveautés.
+- 2026-10-27 — utilisable : installation depuis GitHub (`#v0.1.0`) en attendant npm ; le relay en
+  ligne parle la v1 avec des clés. Relay : un refus au plafond par IP (`RELAY_IP_CONN`) n'est plus
+  une faute vers un ban. Nouvelles sections « Plusieurs rooms à la fois » et « Repli par le
+  relay ». Rien ne change pour l'app.

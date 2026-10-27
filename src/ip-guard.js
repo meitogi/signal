@@ -127,9 +127,11 @@ export function createGuard({ ipConn, pendingMax, connMax, banAfter, banMs, trus
       else if (e !== undefined && e.conns >= ipConn) reason = 'ip';
       else if (pending >= pendingMax) reason = 'pending';
       else if (total >= connMax) reason = 'total';
+      // A full IP is no fault : a home or a carrier NAT holds many rooms behind one address, and a
+      // ban would take every device behind it. The cap costs a lookup ; held silent sockets still
+      // become faults when they miss the hello delay.
       if (reason !== null) {
         refused[reason]++;
-        if (reason === 'ip') fault(ip);
         return reason;
       }
       entry(ip, true).conns++;
