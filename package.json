@@ -1,6 +1,6 @@
 {
   "name": "@meitogi/signal",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Rooms of devices sharing a secret, meeting through a WebSocket relay that can neither read, join nor impersonate them.",
   "type": "module",
   "license": "MIT",

@@ -64,6 +64,7 @@ test('joinRoom : invalid options reject ready and close the room without touchin
     [{ relay: 'wss://relay.example', room: 'r', secret, sendRate: '100' }, 'options'],
     [{ relay: 'wss://relay.example', room: 'r', secret, sendBurst: -1 }, 'options'],
     [{ relay: 'wss://relay.example', room: 'r', secret, sendBurst: 0 }, 'options'],
+    [{ relay: 'wss://relay.example', room: 'r', secret, connect: 'lazy' }, 'options'],
     [{ relay: 'wss://relay.example', room: 'r' }, 'secret'],
     [{ relay: 'wss://relay.example', room: 'r', secret: 'short' }, 'secret'],
     [{ relay: 'ws://localhost:8787', room: 'r', secret: `${secret.slice(0, 42)}=` }, 'secret'],

@@ -1,8 +1,11 @@
 // joinRoom() : the room, the mesh and the handshakes. Platform-free : `createClient(platform)` gets
 // `RTCPeerConnection` and `WebSocket` from the browser entry (index.js) or the Node one (node.js).
 //
-// Who talks to whom : the newcomer offers to every id its `welcome` lists (but itself and the peers it
-// is already directly linked to) ; members never offer, so two peers never offer each other (no glare).
+// Who talks to whom : with `connect: 'auto'` (the default), the newcomer offers to every id its `welcome`
+// lists (but itself and the peers it is already directly linked to) ; members never offer. With
+// `connect: 'manual'`, nobody offers until the app calls `room.connect(id)`, and `members` tells it who is
+// there. Two offers can then cross (both sides connect at once, or a manual connect meets an automatic
+// newcomer) : the smaller id's offer wins, the other side drops its own and answers.
 // A handshake : sealed offer → sealed answer carrying the answerer's proof → the offerer verifies it,
 // applies the answer → the DataChannel opens → the offerer sends its proof on it → the answerer
 // verifies and replies `ok`. `peer` is emitted on `ok` (sent / received) and only then. Before that,
@@ -61,6 +64,7 @@ function validate(o) {
   if (!Number.isInteger(max) || max < 2) return new SignalError('options', '`max` must be an integer ≥ 2');
   if (o.relayKey !== undefined && typeof o.relayKey !== 'string') return new SignalError('options', '`relayKey` must be a string');
   if (o.iceServers !== undefined && !Array.isArray(o.iceServers)) return new SignalError('options', '`iceServers` must be an array');
+  if (o.connect !== undefined && o.connect !== 'auto' && o.connect !== 'manual') return new SignalError('options', "`connect` must be 'auto' or 'manual'");
   for (const name of ['connectMs', 'handshakeMs', 'maxMessageBytes', 'sendRate', 'sendBurst']) {
     const v = o[name];
     if (v !== undefined && !(Number.isInteger(v) && v > 0)) return new SignalError('options', `\`${name}\` must be a positive integer`);
@@ -93,6 +97,10 @@ export function createClient(platform) {
     const relayJoins = Object.create(null);
     /** target id → timestamps of our offers */
     const offers = Object.create(null);
+    /** id → {list: [{resolve, reject}], timer} : `room.connect(id)` calls waiting for that peer */
+    const waiters = Object.create(null);
+    /** the other ids in the room, as the relay last listed them */
+    let members = [];
     let inbound = 0;
     let session = null;
     let ended = false;
@@ -104,8 +112,23 @@ export function createClient(platform) {
       return list;
     };
     Object.defineProperty(room, 'peers', { get: peerList, enumerable: true });
+    Object.defineProperty(room, 'members', { get: () => members.slice(), enumerable: true });
 
-    const incident = (code, message) => room.emit('error', new SignalError(code, message, false));
+    /** Settles the `connect(id)` calls waiting for `id` : with `peer`, or rejected with `error`. */
+    function settle(id, peer, error) {
+      const w = waiters[id];
+      if (w === undefined) return;
+      delete waiters[id];
+      clearTimeout(w.timer);
+      for (const { resolve, reject } of w.list) peer !== null ? resolve(peer) : reject(error);
+    }
+
+    /** A non-fatal incident ; with `id`, the `connect(id)` calls waiting for that peer fail with it. */
+    const incident = (code, message, id) => {
+      const error = new SignalError(code, message, false);
+      if (id !== undefined) settle(id, null, error);
+      room.emit('error', error);
+    };
 
     const bad = validate(options);
     if (bad !== null) {
@@ -113,7 +136,7 @@ export function createClient(platform) {
       return room;
     }
     const {
-      relay, room: roomName, secret, relayKey, iceServers = STUN, fallback = true,
+      relay, room: roomName, secret, relayKey, iceServers = STUN, fallback = true, connect = 'auto',
       connectMs = 20_000, handshakeMs = 10_000, maxMessageBytes = 1_048_576, sendRate, sendBurst, limits,
     } = options;
     const max = options.max ?? 8;
@@ -131,6 +154,7 @@ export function createClient(platform) {
         room.emit('leave', peer, reason);
       });
       room.emit('peer', peer);
+      settle(peer.id, peer, null);
     }
 
     function relayPeer(id) {
@@ -181,9 +205,9 @@ export function createClient(platform) {
       if (code === null) return;
       const direct = code === 'ice';
       if (direct && h.role === 'offerer' && fallback) return joinViaRelay(h.id);
-      if (direct && !fallback) return incident('ice', message);
+      if (direct && !fallback) return incident('ice', message, h.id);
       if (direct) return; // answerer with fallback : the offerer's `join` will come through the relay
-      incident(code, message);
+      incident(code, message, h.id);
     }
 
     function gate(h, channel, expect) {
@@ -252,7 +276,7 @@ export function createClient(platform) {
     }
 
     async function offerTo(id) {
-      if (!allowOffer(id)) return incident('timeout', `not offering to ${id} again : ${OFFERS_PER_MIN} offers in the last minute`);
+      if (!allowOffer(id)) return incident('timeout', `not offering to ${id} again : ${OFFERS_PER_MIN} offers in the last minute`, id);
       const h = newHandshake(id, 'offerer');
       const pc = h.pc;
       try {
@@ -275,10 +299,15 @@ export function createClient(platform) {
     }
 
     async function onOffer(from, inner) {
-      if (handshakes[from] !== undefined) return; // duplicate offer during a handshake : dropped
+      const ours = handshakes[from];
+      if (ours !== undefined) {
+        // A duplicate offer during a handshake is dropped ; crossing offers : the smaller id's wins.
+        if (ours.role !== 'offerer' || from > session.id) return;
+        fail(ours, null);
+      }
       if (peers[from] !== undefined) return; // already linked (direct or relay) : a foreign client re-offering is ignored
-      if (inbound >= INBOUND_MAX) return incident('timeout', `offer from ${from} dropped : ${INBOUND_MAX} handshakes already in flight`);
-      if (!roomHasRoom()) return incident('room-full', `offer from ${from} dropped : room at max ${room.max}`);
+      if (inbound >= INBOUND_MAX) return incident('timeout', `offer from ${from} dropped : ${INBOUND_MAX} handshakes already in flight`, from);
+      if (!roomHasRoom()) return incident('room-full', `offer from ${from} dropped : room at max ${room.max}`, from);
       if (typeof inner.sdp !== 'string' || typeof inner.nonce !== 'string') return incident('proof', `malformed offer from ${from} : dropped`);
       const h = newHandshake(from, 'answerer');
       const pc = h.pc;
@@ -345,7 +374,7 @@ export function createClient(platform) {
       if (relayJoins[id] !== undefined || peers[id] !== undefined) return;
       relayJoins[id] = setTimeout(() => {
         delete relayJoins[id];
-        incident('timeout', `peer ${id} did not accept the relay fallback within ${handshakeMs} ms`);
+        incident('timeout', `peer ${id} did not accept the relay fallback within ${handshakeMs} ms`, id);
       }, handshakeMs);
       session.data(id, new Uint8Array([TAG.join]));
     }
@@ -366,7 +395,7 @@ export function createClient(platform) {
         if (h !== undefined) fail(h, null); // the offerer gave up on the direct path
         const timer = relayJoins[from];
         if (timer !== undefined) { clearTimeout(timer); delete relayJoins[from]; } // our joins crossed : theirs wins
-        if (!roomHasRoom()) return incident('room-full', `relay join from ${from} dropped : room at max ${room.max}`);
+        if (!roomHasRoom()) return incident('room-full', `relay join from ${from} dropped : room at max ${room.max}`, from);
         session.data(from, new Uint8Array([TAG.ok]));
         relayPeer(from);
       } else if (tag === TAG.ok) {
@@ -387,15 +416,27 @@ export function createClient(platform) {
       for (const id in relayJoins) { clearTimeout(relayJoins[id]); delete relayJoins[id]; }
     }
 
+    /** `members` from a relay list ; `members` is emitted when it changed. */
+    function setMembers(list) {
+      const self = session.id;
+      const ids = [];
+      for (const { id } of list) if (typeof id === 'string' && id !== self) ids.push(id);
+      const changed = ids.join() !== members.join();
+      members = ids;
+      if (changed) room.emit('members', ids.slice());
+    }
+
     function onWelcome({ peers: list, max: roomMax, creator, first }) {
       room.id = session.id;
       room.isCreator = creator;
       room.max = roomMax;
       if (!first) dropRelayPeers('relay'); // the other side saw us leave and dropped us too
-      const self = session.id;
-      for (const { id } of list) {
-        if (typeof id !== 'string' || id === self || peers[id] !== undefined || handshakes[id] !== undefined) continue;
-        offerTo(id);
+      setMembers(list);
+      if (connect === 'auto') {
+        for (const id of members) {
+          if (peers[id] !== undefined || handshakes[id] !== undefined) continue;
+          offerTo(id);
+        }
       }
       if (!entered) {
         entered = true;
@@ -408,6 +449,8 @@ export function createClient(platform) {
       for (const p of list) present[p.id] = true;
       for (const id in peers) if (peers[id].via === 'relay' && !present[id]) peers[id].end('relay');
       for (const id in relayJoins) if (!present[id]) { clearTimeout(relayJoins[id]); delete relayJoins[id]; }
+      for (const id in waiters) if (!present[id]) settle(id, null, new SignalError('closed', `peer ${id} left the room`, false));
+      setMembers(list);
     }
 
     function end(error) {
@@ -416,12 +459,31 @@ export function createClient(platform) {
       for (const id in handshakes) fail(handshakes[id], null);
       for (const id in relayJoins) clearTimeout(relayJoins[id]);
       for (const id in peers) peers[id].end('closed');
+      for (const id in waiters) settle(id, null, new SignalError('closed', 'the room is closed', false));
       if (session !== null) session.stop();
       if (!entered) rejectReady(error ?? new SignalError('closed', 'left before entering the room'));
       room.emit('close', error);
     }
 
     room.leave = () => end(null);
+    room.connect = (id) => room.ready.then(() => {
+      const peer = peers[id];
+      if (peer !== undefined) return peer;
+      if (ended) throw new SignalError('closed', 'the room is closed', false);
+      if (!members.includes(id)) throw new SignalError('closed', `${id} is not in the room`, false);
+      return new Promise((resolve, reject) => {
+        let w = waiters[id];
+        if (w === undefined) {
+          // Every path already ends in `peer` or an incident ; this deadline only stops a wait that a
+          // handshake dropped on the other side would leave open (an answer, then no relay `join`).
+          const ms = connectMs + 2 * handshakeMs;
+          w = waiters[id] = { list: [{ resolve, reject }], timer: setTimeout(() => settle(id, null, new SignalError('timeout', `no link to ${id} within ${ms} ms`, false)), ms) };
+          if (handshakes[id] === undefined && relayJoins[id] === undefined) offerTo(id); // a refusal settles at once
+          return;
+        }
+        w.list.push({ resolve, reject });
+      });
+    });
     room.broadcast = (data) => {
       const list = peerList();
       return Promise.all(list.map((p) => p.send(data).catch((e) => { if (e.code !== 'closed') throw e; }))).then(() => {});

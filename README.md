@@ -61,6 +61,7 @@ reconnecte seule (0,5 s, 1 s, 2 s… jusqu'à 30 s) et émet `error` à chaque �
 | `max` | `8` | peers max, soi compris (≥ 2). Fixé par celui qui **crée** la room, plafonné par le relay |
 | `relayKey` | — | clé d'accès si le relay est privé (une clé par application, `RELAY_KEYS`) |
 | `iceServers` | STUN Google | `[]` pour n'utiliser aucun serveur STUN (navigateur et Node) |
+| `connect` | `'auto'` | `'auto'` : en entrant, se relier à tous les membres déjà là ; `'manual'` : à personne, l'app appelle `room.connect(id)` ([CONTRACT.md](CONTRACT.md#liens-à-la-demande--connect-manual)) |
 | `fallback` | `true` | si le direct échoue, passer les messages par le relay (chiffrés, plus lents) |
 | `connectMs` | `20000` | délai pour établir le direct avec un peer, avant repli ou abandon |
 | `handshakeMs` | `10000` | délai pour que la preuve du secret aboutisse |
@@ -72,7 +73,9 @@ reconnecte seule (0,5 s, 1 s, 2 s… jusqu'à 30 s) et émet `error` à chaque �
 | Membre | |
 |---|---|
 | `room.ready`, `room.id`, `room.isCreator`, `room.max`, `room.peers` | voir [CONTRACT.md](CONTRACT.md#room) |
-| `room.on(event, fn)` | retourne la fonction qui désabonne ; événements `peer`, `leave`, `error`, `close` |
+| `room.members` | ids des autres membres, reliés ou non ; événement `members` à chaque arrivée ou départ |
+| `room.connect(id)` | `Promise<Peer>` : se relie à ce membre (ou donne le peer déjà relié) ; deux appels croisés font un seul lien |
+| `room.on(event, fn)` | retourne la fonction qui désabonne ; événements `peer`, `leave`, `members`, `error`, `close` |
 | `room.broadcast(data)` | envoie à tous les peers prêts |
 | `room.leave()` | quitte, ferme tout ; `close` émis avec `null` |
 | `peer.id`, `peer.via` | `'direct'` (WebRTC) ou `'relay'` (repli) |

@@ -4,7 +4,7 @@ Ce document décrit ce que fait le paquet `@meitogi/signal`, assez précisément
 écrire le code d'une application contre lui. Si un point change, ce document change
 avec, et la ligne « Changements » en bas le dit.
 
-> **Statut** : utilisable, version 0.1.1, installée depuis GitHub (pas encore sur npm, voir
+> **Statut** : utilisable, version 0.1.2, installée depuis GitHub (pas encore sur npm, voir
 > « Installer »). Le relay en ligne `wss://signal.du.ranchchoco.boo` parle ce protocole et
 > demande une clé par application.
 
@@ -25,7 +25,7 @@ personne d'autre ne puisse lire, entrer ou se faire passer pour l'un d'eux.
 ## Installer
 
 ```
-npm install github:meitogi/signal#v0.1.1
+npm install github:meitogi/signal#v0.1.2
 ```
 
 En attendant sa publication sur npm, le paquet s'installe depuis son dépôt, épinglé sur un tag :
@@ -100,6 +100,7 @@ est un passe : il porte le secret de la room, et la clé du relay quand on l'y m
 | `max` | `8` | peers max dans la room, soi compris (2 au minimum). Fixé par celui qui **crée** la room ; ignoré pour les autres ; plafonné par le relay |
 | `relayKey` | — | clé d'accès, si le relay est privé (une clé par application, voir « Lancer un relay ») |
 | `iceServers` | `[{ urls: 'stun:stun.l.google.com:19302' }]` | `[]` pour n'utiliser aucun serveur STUN (navigateur et Node) |
+| `connect` | `'auto'` | `'auto'` : en entrant, on se relie à tous les membres déjà là (tout le monde finit relié à tout le monde). `'manual'` : on ne se relie à personne, l'app appelle `room.connect(id)` pour chaque lien voulu (voir « Liens à la demande ») |
 | `fallback` | `true` | si le direct échoue, passer les messages par le relay (plus lent, toujours chiffré) |
 | `connectMs` | `20000` | délai pour établir le direct avec un peer, avant repli ou abandon |
 | `handshakeMs` | `10000` | délai pour que la preuve du secret aboutisse |
@@ -122,6 +123,8 @@ défaut).
 | `room.isCreator` | `true` si j'ai créé la room (et donc fixé `max`) |
 | `room.max` | le maximum en vigueur |
 | `room.peers` | les peers prêts (preuve faite), en tableau |
+| `room.members` | les ids des autres membres de la room, reliés ou non, en tableau (vide avant l'entrée) |
+| `room.connect(id)` | `Promise<Peer>` : se relie à ce membre, ou donne le peer s'il l'est déjà (voir « Liens à la demande ») |
 | `room.on(event, fn)` | retourne une fonction qui désabonne |
 | `room.broadcast(data)` | `Promise<void>` : envoie à tous les peers prêts |
 | `room.leave()` | quitte la room, ferme tout ; `close` est émis avec `null` |
@@ -129,6 +132,7 @@ défaut).
 | Événement | Argument | Quand |
 |---|---|---|
 | `peer` | `Peer` | un peer a prouvé le secret, on peut lui écrire |
+| `members` | `string[]` | la liste des autres membres a changé (une arrivée, un départ) |
 | `leave` | `Peer`, `reason` | un peer prêt est parti ou a été coupé |
 | `error` | `SignalError` | incident **non fatal** (un peer a raté sa preuve, a été coupé pour débit…) ; la room continue |
 | `close` | `SignalError` ou `null` | la room est terminée ; rien ne repart tout seul |
@@ -137,6 +141,45 @@ Le relay peut tomber sans casser les connexions directes déjà ouvertes : la
 room se reconnecte seule au relay (0,5 s, 1 s, 2 s… jusqu'à 30 s) pour accueillir
 les nouveaux venus. `close` n'est émis que pour une fin définitive (`leave()`,
 clé refusée, ban, room pleine à l'entrée).
+
+### Liens à la demande : `connect: 'manual'`
+
+Par défaut, chaque nouveau venu se relie à tous les membres déjà là : avec N membres, N(N-1)/2
+liens. Quand seuls quelques liens servent (une page qui pilote des bots, les bots n'ayant rien à se
+dire), `connect: 'manual'` n'en ouvre aucun tout seul :
+
+```js
+const room = joinRoom({ relay, room: 'atelier', secret, connect: 'manual' });
+
+room.on('members', (ids) => {
+  for (const id of ids) room.connect(id).catch((e) => console.warn(id, e.code)); // la page se relie à chaque bot
+});
+room.on('peer', (peer) => { /* un lien est prêt, qu'on l'ait demandé ou non */ });
+```
+
+- **`room.members`** liste les ids des autres membres, reliés ou non ; l'événement `members` donne
+  la nouvelle liste à chaque arrivée ou départ. Un id ne dit rien de plus que « il connaît le
+  secret » : le rôle (page, bot…) s'échange par messages une fois relié.
+- **`room.connect(id)`** se résout avec le `Peer` une fois la preuve faite, en direct ou par le
+  repli. Il attend `room.ready`. Appelé deux fois, ou sur un peer déjà relié, il donne le même
+  peer : l'app peut l'appeler sans tenir de compte. `peer` est aussi émis, des deux côtés.
+- **L'autre côté accepte seul** : un membre en `'manual'` répond à un `connect()` qui le vise, sans
+  que son app ait rien à faire (la preuve du secret s'applique comme toujours). `'manual'` veut dire
+  « je n'appelle personne de moi-même », pas « je refuse les appels ».
+- **Deux `connect()` croisés** (A vers B et B vers A en même temps) donnent un seul lien : l'offre
+  de l'id le plus petit l'emporte, l'autre côté abandonne la sienne. Les deux promesses se
+  résolvent avec ce lien.
+- **Rejetée** (`SignalError` non fatale) avec `closed` si l'id n'est pas dans la room, s'il part
+  avant d'être relié, ou si la room se ferme ; avec le code de l'incident (`ice` sans repli,
+  `timeout`, `proof`, `room-full`) si le lien échoue ; avec `timeout` au-delà de
+  `connectMs + 2 × handshakeMs` en tout cas. L'incident est aussi émis en `error`, comme en
+  `'auto'`.
+- **Un lien coupé ne revient pas tout seul** : après un `leave` (le peer est parti, ou un peer de
+  repli perdu avec le relay), rappeler `room.connect(id)` s'il le faut encore.
+- **Les deux modes se mélangent** dans une room : un nouveau venu en `'auto'` se relie à tous les
+  membres, `'manual'` compris ; un membre en `'manual'` ne se relie qu'à qui il appelle.
+- `connect()` marche aussi en `'auto'` : il donne le peer déjà relié, ou attend qu'il le soit.
+- Le relay n'a rien de nouveau à faire : il liste déjà les membres et transmet les offres.
 
 ## Peer
 
@@ -192,9 +235,10 @@ valeur.
   porter le repli. Au repos : un ping toutes les 5 s.
 - **Le débit est par connexion** : chaque `joinRoom()` a son propre seau (`sendRate` /
   `sendBurst`) et le relay lui accorde le débit de sa clé. Dix rooms ne se partagent pas un débit.
-- **Une room relie tout le monde à tout le monde** (au plus `max`, plafonné par
-  `RELAY_ROOM_MAX`, 8 par défaut). Pour des liens séparés, une room par lien, chacune avec son
-  secret :
+- **Une room relie tout le monde à tout le monde** par défaut (au plus `max`, plafonné par
+  `RELAY_ROOM_MAX`, 8 par défaut). Pour ne relier que certains membres, `connect: 'manual'` et
+  `room.connect(id)` (voir « Liens à la demande »). Pour des liens que les autres ne doivent même
+  pas voir, une room par lien, chacune avec son secret :
 
   ```
   A1 ⇄ B1, A2 ⇄ B2          deux rooms : chaque paire la sienne
@@ -374,7 +418,7 @@ un HTTP 429 avant même le WebSocket.
   ses anciens clients) et demande une `relayKey` : une par application, donnée par son exploitant.
   Une clé refusée est une faute pour le relay (`key`, fatale, la room ne réessaie pas) : cinq en
   10 min bannissent l'IP. Ne pas boucler sur `joinRoom()` après un `key`.
-- Pour tester sans clé, lancer un relay local (`npx github:meitogi/signal#v0.1.1`, puis
+- Pour tester sans clé, lancer un relay local (`npx github:meitogi/signal#v0.1.2`, puis
   `relay: 'ws://localhost:8787'`).
 
 ## Changements
@@ -402,3 +446,7 @@ un HTTP 429 avant même le WebSocket.
 - 2026-10-27 — 0.1.1, client : le créateur d'une room ne compte plus la négociation directe
   qu'un peer abandonne quand ce peer se replie par le relay ; une room à `max: 2` acceptait
   mal ce repli (`room-full` d'un côté, `timeout` de l'autre). Rien ne change pour l'app.
+- 2026-10-27 — 0.1.2, client : option `connect: 'manual'` (on ne se relie à personne en entrant),
+  `room.connect(id)` pour un lien à la demande, `room.members` et l'événement `members` pour savoir
+  qui est là. Deux offres qui se croisent donnent un seul lien (l'id le plus petit l'emporte). Le
+  défaut reste `'auto'` : rien ne change pour une app existante. Relay inchangé.
